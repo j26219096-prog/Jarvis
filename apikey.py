@@ -1,0 +1,2 @@
+GEMINI_API_KEY="AIzaSyBxpQarseMt2cccHtXirHYEaomIEowEXOA"
+PICOVOICE_API_KEY="0LTmnjtaim2nMgqvqP9KhbiVyUft32ZKXole0mZC+hStfGX3Np9icg=="
