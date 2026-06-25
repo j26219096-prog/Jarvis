@@ -20,6 +20,9 @@ import os
 import sys
 import time
 import datetime
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 import threading
 import requests as http_requests
 import wikipedia
@@ -157,13 +160,13 @@ def execute_command(command: str) -> dict:
 
     # Time
     if "time" in command or "what time" in command:
-        now   = datetime.datetime.now().strftime("%I:%M %p")
-        reply = f"The current time is {now}."
+        now   = datetime.datetime.now(IST).strftime("%I:%M %p")
+        reply = f"The current time is {now} IST."
         return {"reply": reply, "action": None}
 
     # Date
     if "date" in command or "today" in command:
-        today = datetime.datetime.now().strftime("%A, %B %d %Y")
+        today = datetime.datetime.now(IST).strftime("%A, %B %d %Y")
         return {"reply": f"Today is {today}.", "action": None}
 
     # Groq LLM fallback
@@ -614,7 +617,7 @@ def index():
 
 @app.route("/greet")
 def greet():
-    hour = datetime.datetime.now().hour
+    hour = datetime.datetime.now(IST).hour
     if 5 <= hour < 12:
         msg = "Good morning, sir. Systems are fully operational and online."
     elif 12 <= hour < 17:
