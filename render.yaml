@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: jarvis-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn jarvis_cloud:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false        # You will paste this manually in Render dashboard
+      - key: NEWSAPI_KEY
+        sync: false        # Optional — for world news feature
+    plan: free
