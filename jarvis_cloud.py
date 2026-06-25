@@ -549,6 +549,65 @@ HTML_PAGE = """
     #noVoice h2{font-family:'Orbitron',monospace;font-size:1rem;letter-spacing:2px;color:var(--red);}
     #noVoice p{color:var(--muted);font-size:0.9rem;line-height:1.6;}
 
+    /* VOICE PICKER MODAL */
+    .vmodal{
+      display:none;position:fixed;inset:0;z-index:400;
+      background:rgba(0,0,0,0.82);
+      align-items:flex-end;justify-content:center;
+    }
+    .vmodal.on{display:flex;}
+    .vmodal-inner{
+      width:100%;max-width:480px;
+      background:#00060f;
+      border:1px solid rgba(0,212,255,0.25);
+      border-bottom:none;border-radius:16px 16px 0 0;
+      padding:20px;max-height:72vh;
+      display:flex;flex-direction:column;
+    }
+    .vmodal-hdr{
+      display:flex;justify-content:space-between;align-items:center;
+      font-family:'Orbitron',monospace;font-size:0.62rem;
+      letter-spacing:3px;color:var(--blue);margin-bottom:14px;flex-shrink:0;
+    }
+    .vmodal-hdr button{
+      background:none;border:1px solid var(--muted);color:var(--muted);
+      border-radius:4px;padding:3px 8px;cursor:pointer;font-size:0.8rem;
+      transition:all 0.15s;
+    }
+    .vmodal-hdr button:active{border-color:var(--red);color:var(--red);}
+    .vlist{
+      overflow-y:auto;display:flex;flex-direction:column;gap:6px;
+      scrollbar-width:thin;scrollbar-color:var(--muted) transparent;
+    }
+    .vlist::-webkit-scrollbar{width:3px;}
+    .vlist::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px;}
+    .vitem{
+      padding:12px 14px;border-radius:8px;
+      border:1px solid var(--muted);
+      cursor:pointer;transition:all 0.15s;
+      font-family:'Rajdhani',sans-serif;
+    }
+    .vitem:active,.vitem.sel{
+      border-color:var(--blue);color:var(--blue);
+      background:rgba(0,212,255,0.06);
+      box-shadow:0 0 10px rgba(0,212,255,0.15);
+    }
+    .vitem .vn{font-size:0.9rem;font-weight:600;color:var(--text);}
+    .vitem.sel .vn{color:var(--blue);}
+    .vitem .vl{font-size:0.65rem;font-family:'Share Tech Mono',monospace;color:var(--muted);margin-top:2px;}
+    .sel-mark{float:right;color:var(--green);font-size:0.8rem;display:none;}
+    .vitem.sel .sel-mark{display:inline;}
+
+    /* Voice button in header */
+    .vbtn{
+      background:none;border:1px solid var(--muted);
+      color:var(--muted);border-radius:6px;
+      padding:4px 9px;cursor:pointer;font-size:0.78rem;
+      transition:all 0.15s;letter-spacing:1px;
+      font-family:'Share Tech Mono',monospace;
+    }
+    .vbtn:active{border-color:var(--blue);color:var(--blue);}
+
     @media(min-height:700px){
       .arc-wrap{width:164px;height:164px;}
       .r1{width:164px;height:164px;}
@@ -568,9 +627,12 @@ HTML_PAGE = """
 <header class="hud-header">
   <div class="hud-row1">
     <div class="j-name">J.A.R.V.I.S.</div>
-    <div class="sys-badge">
-      <div class="led" id="led"></div>
-      <span class="sys-lbl" id="sysLbl">ONLINE</span>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <button class="vbtn" onclick="openVoicePicker()" title="Change Voice">&#128266; VOICE</button>
+      <div class="sys-badge">
+        <div class="led" id="led"></div>
+        <span class="sys-lbl" id="sysLbl">ONLINE</span>
+      </div>
     </div>
   </div>
   <div class="hud-meta">
@@ -623,6 +685,17 @@ HTML_PAGE = """
 
 <div class="toast" id="toast"></div>
 
+<!-- Voice picker modal -->
+<div class="vmodal" id="vModal">
+  <div class="vmodal-inner">
+    <div class="vmodal-hdr">
+      <span>&#128266; SELECT JARVIS VOICE</span>
+      <button onclick="closeVoicePicker()">&#10005; CLOSE</button>
+    </div>
+    <div class="vlist" id="vList"></div>
+  </div>
+</div>
+
 <div id="noVoice">
   <h2>&#9888; VOICE NOT SUPPORTED</h2>
   <p>Please use <strong>Chrome on Android</strong><br>or <strong>Safari on iOS</strong> for voice input.</p>
@@ -642,19 +715,75 @@ HTML_PAGE = """
 
   const synth = window.speechSynthesis;
   let voices  = [];
-  function loadVoices(){ voices = synth.getVoices(); }
-  if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
+  let selVoice = null;
+
+  function loadVoices(){
+    voices = synth.getVoices();
+    // Restore saved voice preference
+    const saved = localStorage.getItem('jarvisVoiceURI');
+    if(saved && !selVoice){
+      const found = voices.find(v=>v.voiceURI===saved);
+      if(found) selVoice = found;
+    }
+  }
+  if(synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
   loadVoices();
+
+  function getBestVoice(){
+    if(selVoice) return selVoice;
+    return voices.find(v=>v.lang.startsWith('en')&&/daniel|alex|mark|google uk english male/i.test(v.name))
+        || voices.find(v=>v.lang.startsWith('en-')&&/male/i.test(v.name))
+        || voices.find(v=>v.lang.startsWith('en'))
+        || null;
+  }
+
+  // ── Voice Picker ─────────────────────────────────────────
+  function openVoicePicker(){
+    const modal = document.getElementById('vModal');
+    const list  = document.getElementById('vList');
+    list.innerHTML = '';
+    // Reload voices in case they weren't ready
+    if(voices.length===0) loadVoices();
+    const engVoices = voices.filter(v=>v.lang.toLowerCase().startsWith('en'));
+    if(engVoices.length===0){
+      list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No voices loaded yet.<br>Wait a moment and try again.</p>';
+    } else {
+      engVoices.forEach(v=>{
+        const item = document.createElement('div');
+        const isSel = selVoice && selVoice.voiceURI===v.voiceURI;
+        item.className = 'vitem'+(isSel?' sel':'');
+        item.innerHTML = '<span class="vn">'+v.name+'<span class="sel-mark"> &#10003;</span></span>'
+          +'<div class="vl">'+v.lang+(v.localService?' &bull; LOCAL':' &bull; NETWORK')+'</div>';
+        item.onclick = ()=>{
+          selVoice = v;
+          localStorage.setItem('jarvisVoiceURI', v.voiceURI);
+          closeVoicePicker();
+          // Play preview
+          synth.cancel();
+          const u = new SpeechSynthesisUtterance('Voice confirmed. I am J.A.R.V.I.S., at your service.');
+          u.voice=v; u.rate=0.92; u.pitch=0.85; u.volume=1;
+          synth.speak(u);
+          showToast('VOICE SET: '+v.name.toUpperCase());
+        };
+        list.appendChild(item);
+      });
+    }
+    modal.classList.add('on');
+  }
+  function closeVoicePicker(){
+    document.getElementById('vModal').classList.remove('on');
+  }
+  // Close modal on backdrop tap
+  document.getElementById('vModal').addEventListener('click', function(e){
+    if(e.target===this) closeVoicePicker();
+  });
 
   function speak(text){
     if(!synth) return;
     synth.cancel();
     const u = new SpeechSynthesisUtterance(text);
     u.rate=0.92; u.pitch=0.85; u.volume=1;
-    const pick = voices.find(v=>v.lang.startsWith('en')&&/daniel|alex|mark|google uk english male/i.test(v.name))
-              || voices.find(v=>v.lang.startsWith('en-')&&/male/i.test(v.name))
-              || voices.find(v=>v.lang.startsWith('en'))
-              || null;
+    const pick = getBestVoice();
     if(pick) u.voice=pick;
     synth.speak(u);
   }
