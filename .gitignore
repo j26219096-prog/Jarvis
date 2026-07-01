@@ -3,3 +3,4 @@ jarvis_memory/
 __pycache__/
 *.pyc
 .env
+apikey.py

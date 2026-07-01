@@ -1,618 +1,804 @@
 """
-J.A.R.V.I.S. Cloud Edition
-===========================
-24/7 access from any device — laptop can be OFF.
+J.A.R.V.I.S. v2 - Cloud Edition
 
-Deploy to Render.com (free):
-  1. Push this folder to GitHub
-  2. Connect repo on render.com → New Web Service
-  3. Add env var: GROQ_API_KEY = <your key from console.groq.com>
-  4. Deploy — get your permanent HTTPS URL
-  5. Open on phone from anywhere in the world
+║  Primary  : Gemini 2.0 Flash (REST API – no extra SDK)               ║
+║  Fallback : Groq  Llama-3.3-70B                                      ║
+║  Features : Male Voice · Torch · Vibrate · Wake Lock · PWA · Offline ║
+║  AI Level : Claude-equivalent depth for coding & technical queries    ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Deploy to Render.com:
+  1. Push folder to GitHub
+  2. New Web Service → connect repo
+  3. Set env vars: GEMINI_API_KEY, GROQ_API_KEY, NEWSAPI_KEY (optional)
+  4. Deploy → open HTTPS URL on phone → "Add to Home Screen"
 
 Local test:
-  pip install flask groq chromadb requests wikipedia
-  set GROQ_API_KEY=your_key_here
+  set GEMINI_API_KEY=<your key>
+  set GROQ_API_KEY=<your key>
   python jarvis_cloud.py
 """
 
-import os
-import sys
-import time
-import datetime
+import os, sys, time, datetime, threading
+
+# Force UTF-8 output on Windows (prevents cp1252 encoding errors)
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+import requests as http_requests
+import wikipedia, chromadb
 from zoneinfo import ZoneInfo
+from flask import Flask, request, jsonify, render_template_string, Response
 
 IST = ZoneInfo("Asia/Kolkata")
-import threading
-import requests as http_requests
-import wikipedia
-import chromadb
-
-from flask import Flask, request, jsonify, render_template_string
-from groq import Groq
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")   # Set as env var on Render
-GROQ_MODEL     = "llama3-70b-8192"                     # Free, fast, powerful
-NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
-MAX_HISTORY    = 5
-PORT           = int(os.environ.get("PORT", 5000))     # Render sets PORT automatically
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GROQ LLM CLIENT
-# ══════════════════════════════════════════════════════════════════════════════
-
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-BASE_SYSTEM_PROMPT = (
-    "You are J.A.R.V.I.S., an advanced, witty, and highly capable AI assistant. "
-    "You speak in a calm, professional, slightly British tone with occasional dry humour, "
-    "inspired by Tony Stark's Friday. "
-    "Keep responses concise (1-3 sentences unless asked for more)."
-)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHROMADB  (EphemeralClient — works on cloud with no local disk)
-# ══════════════════════════════════════════════════════════════════════════════
 
 try:
-    chroma_client     = chromadb.EphemeralClient()
-    memory_collection = chroma_client.get_or_create_collection(
-        name="personal_knowledge",
-        metadata={"hnsw:space": "cosine"}
-    )
-    MEMORY_AVAILABLE = True
-    print("[BOOT] ChromaDB (ephemeral) ready.")
-except Exception as e:
-    memory_collection = None
-    MEMORY_AVAILABLE  = False
-    print(f"[BOOT] ChromaDB unavailable: {e}")
+    from groq import Groq
+    _GROQ_LIB = True
+except ImportError:
+    _GROQ_LIB = False
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CHAT HISTORY & RAG
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════
 
-chat_history: list[dict] = []
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
+GEMINI_MODEL   = "gemini-2.0-flash-exp"
+GROQ_MODEL     = "llama-3.3-70b-versatile"
+MAX_HISTORY    = 10
+PORT           = int(os.environ.get("PORT", 5000))
 
-def update_history(role: str, content: str) -> None:
-    chat_history.append({"role": role, "content": content})
-    if len(chat_history) > MAX_HISTORY * 2:
-        del chat_history[:len(chat_history) - MAX_HISTORY * 2]
+# ══════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT  — Claude-level quality
+# ══════════════════════════════════════════════════════════════════════
 
-def query_memory(text: str) -> str:
-    if not MEMORY_AVAILABLE or not memory_collection or memory_collection.count() == 0:
+SYSTEM_PROMPT = """You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), Jawahar's elite personal AI assistant — inspired by Tony Stark's FRIDAY/JARVIS.
+
+## PERSONALITY
+- Calm, precise, confident British tone with dry wit
+- Address user as "sir" occasionally (not every message)
+- Never say "I cannot" — adapt and find a solution
+- Be direct and efficient, not verbose
+
+## INTELLIGENCE STANDARD (match Claude Opus quality)
+**CODING** — write complete, working, production-ready code. Never truncate. Include error handling. Add a concise explanation after.
+**DEBUGGING** — identify the exact root cause, explain why it happens, give the precise fix with corrected code.
+**TECHNICAL** — expert-level depth with concrete examples, best practices, and trade-offs.
+**GENERAL QUESTIONS** — thorough but concise. No filler phrases.
+**COMPLEX PROBLEMS** — reason step-by-step. Show your work.
+**MATH** — compute accurately. Show working if non-trivial.
+**CREATIVE** — original, thoughtful, well-crafted responses.
+
+## CODE FORMAT (mandatory for ALL code)
+```language
+// Always complete, never truncated
+```
+- Use the correct language tag (python, javascript, typescript, sql, bash, etc.)
+- Never output ellipsis (...) or "add your code here" — always write the actual code
+- Add inline comments for non-obvious logic
+
+## EXPERTISE
+Python, JavaScript, TypeScript, React, Next.js, Node.js, Express, FastAPI
+SQL, PostgreSQL, MongoDB, Redis | C++, Java, Go, Rust | Flutter, React Native
+ML/AI, LLMs, RAG, Vector DBs | System Design, Algorithms, Data Structures
+Docker, Kubernetes, CI/CD, AWS/GCP/Azure | Web APIs, REST, GraphQL, WebSockets
+Security, Performance Optimization, Code Review"""
+
+# ══════════════════════════════════════════════════════════════════════
+# CHROMADB MEMORY
+# ══════════════════════════════════════════════════════════════════════
+
+try:
+    _chroma  = chromadb.EphemeralClient()
+    _mem_col = _chroma.get_or_create_collection("jarvis_v2", metadata={"hnsw:space": "cosine"})
+    MEM_OK   = True
+    print("[BOOT] Memory bank ready")
+except Exception as _e:
+    _mem_col = None
+    MEM_OK   = False
+    print(f"[BOOT] Memory: {_e}")
+
+# ══════════════════════════════════════════════════════════════════════
+# CHAT HISTORY
+# ══════════════════════════════════════════════════════════════════════
+
+_history: list[dict] = []
+_hist_lock = threading.Lock()
+
+def push_history(role: str, content: str) -> None:
+    with _hist_lock:
+        _history.append({"role": role, "content": content})
+        if len(_history) > MAX_HISTORY * 2:
+            del _history[:len(_history) - MAX_HISTORY * 2]
+
+def get_history_snap() -> list[dict]:
+    with _hist_lock:
+        return list(_history)
+
+def recall(text: str) -> str:
+    if not MEM_OK or _mem_col.count() == 0:
         return ""
     try:
-        res  = memory_collection.query(query_texts=[text], n_results=min(3, memory_collection.count()))
-        docs = res.get("documents", [[]])[0]
-        return "\n\n".join(f"[Memory {i+1}]: {d}" for i, d in enumerate(docs)) if docs else ""
+        r    = _mem_col.query(query_texts=[text], n_results=min(3, _mem_col.count()))
+        docs = r.get("documents", [[]])[0]
+        return "\n".join(f"• {d}" for d in docs) if docs else ""
     except Exception:
         return ""
 
-def ask_groq(user_text: str) -> str:
-    if not groq_client:
-        return "GROQ_API_KEY is not configured. Please add it as an environment variable on Render."
+# ══════════════════════════════════════════════════════════════════════
+# AI — GEMINI 2.0 FLASH  (direct REST, no extra SDK)
+# ══════════════════════════════════════════════════════════════════════
 
-    context = query_memory(user_text)
-    system  = BASE_SYSTEM_PROMPT
-    if context:
-        system += "\n\nPersonal knowledge about the user:\n\n" + context
+_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-    update_history("user", user_text)
-    messages = [{"role": "system", "content": system}] + chat_history
+def _call_gemini(user_text: str) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
 
-    try:
-        resp  = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=256,
-            temperature=0.7,
-        )
-        reply = resp.choices[0].message.content.strip()
-    except Exception as e:
-        reply = f"Neural core error: {e}"
+    snap = get_history_snap()
+    ctx  = recall(user_text)
+    msg  = f"{user_text}\n\n[Relevant context about me: {ctx}]" if ctx else user_text
 
-    update_history("assistant", reply)
-    return reply
+    # Build conversation contents
+    contents = [
+        {"role": "user" if m["role"] == "user" else "model",
+         "parts": [{"text": m["content"]}]}
+        for m in snap
+    ]
+    contents.append({"role": "user", "parts": [{"text": msg}]})
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COMMAND ROUTER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def execute_command(command: str) -> dict:
-    """
-    Returns a dict: { "reply": str, "action": str|None }
-    'action' can be "open_url" — the frontend handles opening URLs on the phone.
-    """
-    command = command.strip().lower()
-
-    # World Monitor
-    if any(kw in command for kw in ["world news", "global news", "happening around the world", "news update"]):
-        return world_monitor()
-
-    # YouTube
-    if "youtube" in command:
-        return {"reply": "Opening YouTube now.", "action": "open_url", "url": "https://www.youtube.com"}
-
-    # Wikipedia
-    if any(kw in command for kw in ["wikipedia", "who is", "what is", "tell me about", "search"]):
-        query = command
-        for filler in ["wikipedia", "search for", "search", "tell me about", "who is", "what is", "jarvis"]:
-            query = query.replace(filler, "")
-        query = query.strip()
-        if not query:
-            return {"reply": "What would you like me to search for?", "action": None}
-        return {"reply": wiki_search(query), "action": None}
-
-    # Memory save
-    if any(kw in command for kw in ["remember this", "save to memory", "note this"]):
-        note = command
-        for t in ["remember this", "save to memory", "note this", "jarvis"]:
-            note = note.replace(t, "")
-        note = note.strip(": ").strip()
-        if note and MEMORY_AVAILABLE:
-            memory_collection.add(documents=[note], ids=[f"mem_{int(time.time())}"])
-            return {"reply": "Saved to memory.", "action": None}
-        return {"reply": "Nothing to save, or memory bank is unavailable.", "action": None}
-
-    # Time
-    if "time" in command or "what time" in command:
-        now   = datetime.datetime.now(IST).strftime("%I:%M %p")
-        reply = f"The current time is {now} IST."
-        return {"reply": reply, "action": None}
-
-    # Date
-    if "date" in command or "today" in command:
-        today = datetime.datetime.now(IST).strftime("%A, %B %d %Y")
-        return {"reply": f"Today is {today}.", "action": None}
-
-    # Weather (free - no API key needed)
-    if any(kw in command for kw in ["weather", "temperature", "forecast", "rain", "sunny", "how hot", "how cold"]):
-        return get_weather()
-
-    # Google Maps
-    if any(kw in command for kw in ["open maps", "maps", "navigate", "directions", "google maps"]):
-        query = command
-        for f in ["open maps", "navigate to", "navigate", "directions to", "google maps", "maps"]:
-            query = query.replace(f, "")
-        query = query.strip()
-        url = f"https://maps.google.com/maps?q={query.replace(' ', '+')}" if query else "https://maps.google.com"
-        return {"reply": f"Opening maps{f' for {query}' if query else ''}.", "action": "open_url", "url": url, "url_label": "GOOGLE MAPS"}
-
-    # WhatsApp
-    if any(kw in command for kw in ["whatsapp", "open whatsapp"]):
-        return {"reply": "Opening WhatsApp.", "action": "open_url", "url": "https://wa.me", "url_label": "WHATSAPP"}
-
-    # Spotify / Music
-    if any(kw in command for kw in ["spotify", "play music", "open spotify", "music"]):
-        return {"reply": "Opening Spotify.", "action": "open_url", "url": "https://open.spotify.com", "url_label": "SPOTIFY"}
-
-    # Instagram
-    if any(kw in command for kw in ["instagram", "open instagram"]):
-        return {"reply": "Opening Instagram.", "action": "open_url", "url": "https://www.instagram.com", "url_label": "INSTAGRAM"}
-
-    # Netflix
-    if any(kw in command for kw in ["netflix", "open netflix"]):
-        return {"reply": "Opening Netflix.", "action": "open_url", "url": "https://www.netflix.com", "url_label": "NETFLIX"}
-
-    # Twitter / X
-    if any(kw in command for kw in ["twitter", "open twitter", "open x"]):
-        return {"reply": "Opening X.", "action": "open_url", "url": "https://x.com", "url_label": "X"}
-
-    # LinkedIn
-    if any(kw in command for kw in ["linkedin", "open linkedin"]):
-        return {"reply": "Opening LinkedIn.", "action": "open_url", "url": "https://www.linkedin.com", "url_label": "LINKEDIN"}
-
-    # Calculator
-    if any(kw in command for kw in ["calculator", "calculate", "compute"]):
-        return {"reply": "Opening calculator.", "action": "open_url", "url": "https://www.google.com/search?q=calculator", "url_label": "CALCULATOR"}
-
-    # GitHub
-    if any(kw in command for kw in ["github", "open github"]):
-        return {"reply": "Opening GitHub.", "action": "open_url", "url": "https://github.com", "url_label": "GITHUB"}
-
-    # Groq LLM fallback
-    reply = ask_groq(command)
-    return {"reply": reply, "action": None}
-
-
-def world_monitor() -> dict:
-    lines = []
-    if not NEWSAPI_KEY:
-        lines.append("NewsAPI key not configured. Add NEWSAPI_KEY environment variable on Render.")
-    else:
-        try:
-            url  = f"https://newsapi.org/v2/top-headlines?language=en&pageSize=2&apiKey={NEWSAPI_KEY}"
-            resp = http_requests.get(url, timeout=10)
-            resp.raise_for_status()
-            articles = resp.json().get("articles", [])
-            if articles:
-                lines.append("Top global headlines:")
-                for i, a in enumerate(articles[:2], 1):
-                    headline = a.get("title", "No title").split(" - ")[0].strip()
-                    lines.append(f"{i}. {headline}")
-            else:
-                lines.append("No headlines available right now.")
-        except Exception as e:
-            lines.append(f"News feed error: {e}")
-    lines.append("Opening the live situational-awareness map.")
-    return {
-        "reply":  "\n".join(lines),
-        "action": "open_url",
-        "url":    "https://liveuamap.com/"
+    payload = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": 8192,
+            "temperature": 0.72,
+            "topP": 0.95,
+        },
     }
 
+    url = f"{_GEMINI_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    resp = http_requests.post(url, json=payload, timeout=45,
+                              headers={"Content-Type": "application/json"})
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+# ----------------------------------------------------------------------
+# AI — GROQ FALLBACK  (Llama-3.3-70B)
+# ----------------------------------------------------------------------
+
+_groq_client = Groq(api_key=GROQ_API_KEY) if (_GROQ_LIB and GROQ_API_KEY) else None
+if _groq_client:
+    print(f"[BOOT] Groq {GROQ_MODEL} ready (fallback)")
+
+
+def _call_groq(user_text: str) -> str:
+    if not _groq_client:
+        raise RuntimeError("Groq client not initialised")
+    snap = get_history_snap()
+    ctx  = recall(user_text)
+    sys  = SYSTEM_PROMPT + (f"\n\nKnown facts about the user:\n{ctx}" if ctx else "")
+    msgs = [{"role": "system", "content": sys}] + snap + [{"role": "user", "content": user_text}]
+    r    = _groq_client.chat.completions.create(
+        model=GROQ_MODEL, messages=msgs,
+        max_tokens=8192, temperature=0.72
+    )
+    return r.choices[0].message.content.strip()
+
+# ══════════════════════════════════════════════════════════════════════
+# UNIFIED AI DISPATCHER
+# ══════════════════════════════════════════════════════════════════════
+
+def ask_ai(user_text: str) -> str:
+    """Try Gemini → Groq fallback. Always returns a string."""
+    reply  = ""
+    source = "none"
+
+    for fn, name in [(_call_gemini, "Gemini"), (_call_groq, "Groq")]:
+        try:
+            reply = fn(user_text)
+            if reply:
+                source = name
+                break
+        except Exception as exc:
+            print(f"[{name}] Error: {exc}")
+
+    if not reply:
+        reply = (
+            "My AI cores are temporarily unreachable, sir. "
+            "Please verify GEMINI_API_KEY and GROQ_API_KEY environment variables."
+        )
+
+    print(f"[AI:{source}] {user_text[:70]}...")
+    push_history("user", user_text)
+    push_history("assistant", reply)
+    return reply
+
+# ══════════════════════════════════════════════════════════════════════
+# HELPER BUILDERS
+# ══════════════════════════════════════════════════════════════════════
+
+def _r(reply: str) -> dict:
+    return {"reply": reply, "action": None}
+
+def _open(reply: str, url: str, label: str) -> dict:
+    return {"reply": reply, "action": "open_url", "url": url, "url_label": label}
+
+# ══════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════
 
 def wiki_search(query: str) -> str:
     try:
-        return wikipedia.summary(query, sentences=2, auto_suggest=True)
-    except wikipedia.exceptions.DisambiguationError as e:
-        return f"Multiple results. Did you mean: {e.options[0]}?"
+        return wikipedia.summary(query, sentences=3, auto_suggest=True)
+    except wikipedia.exceptions.DisambiguationError as exc:
+        return f"Multiple results. Did you mean: {exc.options[0]}?"
     except wikipedia.exceptions.PageError:
-        return "No Wikipedia page found for that topic."
-    except Exception as e:
-        return f"Wikipedia error: {e}"
+        return f"No Wikipedia page found for '{query}'."
+    except Exception as exc:
+        return f"Wikipedia error: {exc}"
 
+def world_news() -> dict:
+    lines = []
+    if NEWSAPI_KEY:
+        try:
+            resp = http_requests.get(
+                f"https://newsapi.org/v2/top-headlines?language=en&pageSize=3&apiKey={NEWSAPI_KEY}",
+                timeout=10,
+            )
+            arts = resp.json().get("articles", [])
+            if arts:
+                lines.append("Top global headlines:")
+                for i, a in enumerate(arts[:3], 1):
+                    lines.append(f"{i}. {a.get('title','').split(' - ')[0].strip()}")
+        except Exception as exc:
+            lines.append(f"News feed error: {exc}")
+    if not lines:
+        lines.append("Opening live situational-awareness map.")
+    return {"reply": "\n".join(lines),
+            "action": "open_url", "url": "https://liveuamap.com/", "url_label": "LIVE MAP"}
 
-def get_weather() -> dict:
-    """Fetch live weather using wttr.in — no API key required."""
+def get_weather(cmd: str) -> dict:
+    city = ""
+    for f in ("weather in", "temperature in", "forecast for"):
+        if f in cmd:
+            city = cmd.split(f, 1)[-1].strip()
+            break
     try:
-        resp = http_requests.get("https://wttr.in/?format=%C+%t,+humidity+%h", timeout=8)
+        q   = city.replace(" ", "+") if city else ""
+        url = f"https://wttr.in/{q}?format=%C+%t,+Humidity+%h" if q else "https://wttr.in/?format=%C+%t,+Humidity+%h"
+        resp = http_requests.get(url, timeout=8)
         if resp.status_code == 200:
-            info = resp.text.strip()
-            return {"reply": f"Current weather: {info}. Shall I open the full forecast?", "action": None}
-        return {"reply": "Weather service is unavailable right now, sir.", "action": None}
+            loc = f" in {city.title()}" if city else ""
+            return _r(f"Weather{loc}: {resp.text.strip()}. Shall I open the full forecast?")
     except Exception:
-        return {"reply": "Cannot reach weather service at the moment.", "action": None}
+        pass
+    return _r("Weather service is unreachable at the moment, sir.")
 
+# ══════════════════════════════════════════════════════════════════════
+# COMMAND ROUTER
+# ══════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HTML — Iron Man HUD • Voice-only • Mobile-first
-# ══════════════════════════════════════════════════════════════════════════════
+APP_TABLE: list[tuple[tuple, str, str]] = [
+    (("youtube", "open youtube"),                          "https://youtube.com",                         "YOUTUBE"),
+    (("spotify", "open spotify", "play music", "music"),   "https://open.spotify.com",                    "SPOTIFY"),
+    (("whatsapp", "open whatsapp"),                        "https://wa.me",                               "WHATSAPP"),
+    (("instagram", "open instagram"),                      "https://instagram.com",                       "INSTAGRAM"),
+    (("netflix", "open netflix"),                          "https://netflix.com",                         "NETFLIX"),
+    (("twitter", "open twitter", "open x"),                "https://x.com",                               "X / TWITTER"),
+    (("linkedin", "open linkedin"),                        "https://linkedin.com",                        "LINKEDIN"),
+    (("github", "open github"),                            "https://github.com",                          "GITHUB"),
+    (("gmail", "open gmail"),                              "https://mail.google.com",                     "GMAIL"),
+    (("amazon", "open amazon"),                            "https://amazon.in",                           "AMAZON"),
+    (("flipkart", "open flipkart"),                        "https://flipkart.com",                        "FLIPKART"),
+    (("calculator", "open calculator"),                    "https://google.com/search?q=calculator",      "CALCULATOR"),
+    (("chat gpt", "open chatgpt"),                         "https://chatgpt.com",                         "CHATGPT"),
+    (("reddit", "open reddit"),                            "https://reddit.com",                          "REDDIT"),
+]
 
-HTML_PAGE = """
-<!DOCTYPE html>
+def execute_command(command: str) -> dict:
+    cmd = command.strip().lower()
+
+    # ── Time ─────────────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("what time", "time is it", "current time", "time now")):
+        t = datetime.datetime.now(IST).strftime("%I:%M %p")
+        return _r(f"It's {t} IST, sir.")
+
+    # ── Date ─────────────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("what date", "today", "what day", "date today", "what is today")):
+        d = datetime.datetime.now(IST).strftime("%A, %d %B %Y")
+        return _r(f"Today is {d}.")
+
+    # ── News ──────────────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("world news", "global news", "headlines", "news update", "what's happening")):
+        return world_news()
+
+    # ── Weather ───────────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("weather", "temperature", "forecast", "how hot", "how cold")):
+        return get_weather(cmd)
+
+    # ── App shortcuts ─────────────────────────────────────────────────────────
+    for (kws, url, label) in APP_TABLE:
+        if any(k in cmd for k in kws):
+            return _open(f"Opening {label}.", url, label)
+
+    # ── Maps / navigate ───────────────────────────────────────────────────────
+    if any(k in cmd for k in ("maps", "navigate", "directions", "google maps")):
+        q = cmd
+        for f in ("open maps", "navigate to", "directions to", "google maps", "maps"):
+            q = q.replace(f, "")
+        q = q.strip()
+        url = f"https://maps.google.com/?q={q.replace(' ', '+')}" if q else "https://maps.google.com"
+        return _open(f"Opening Maps{f' for {q}' if q else ''}.", url, "MAPS")
+
+    # ── Google search ─────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("search for", "search google", "google search", "google for")):
+        q = cmd
+        for f in ("search for", "search google for", "google for", "google", "search", "jarvis"):
+            q = q.replace(f, "")
+        q = q.strip()
+        if q:
+            return _open(f"Searching for '{q}'.",
+                         f"https://google.com/search?q={q.replace(' ', '+')}", "GOOGLE SEARCH")
+
+    # ── Wikipedia ─────────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("who is", "tell me about", "wikipedia about")) and "search" not in cmd:
+        q = cmd
+        for f in ("who is", "tell me about", "wikipedia about", "jarvis"):
+            q = q.replace(f, "")
+        q = q.strip()
+        if q:
+            return _r(wiki_search(q))
+
+    # ── Memory save ───────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("remember", "save to memory", "note this", "don't forget")):
+        note = cmd
+        for f in ("remember that", "remember", "save to memory", "note this", "don't forget", "jarvis", ":"):
+            note = note.replace(f, "")
+        note = note.strip()
+        if note and MEM_OK:
+            _mem_col.add(documents=[note], ids=[f"m{int(time.time())}"])
+            return _r("Committed to memory, sir.")
+        return _r("Nothing to save, or memory bank is unavailable.")
+
+    # ── Memory recall ─────────────────────────────────────────────────────────
+    if any(k in cmd for k in ("what do you know", "what do you remember", "show memories", "my notes")):
+        if MEM_OK and _mem_col.count() > 0:
+            docs = _mem_col.get().get("documents", [])
+            txt  = "\n".join(f"{i+1}. {d}" for i, d in enumerate(docs[:6]))
+            return _r(f"Here's what I have on record:\n{txt}")
+        return _r("Memory bank is empty, sir.")
+
+    # ── AI fallback ───────────────────────────────────────────────────────────
+    return _r(ask_ai(command.strip()))
+
+# ══════════════════════════════════════════════════════════════════════
+# SERVICE WORKER  (for PWA offline caching)
+# ══════════════════════════════════════════════════════════════════════
+
+SERVICE_WORKER = r"""
+const CACHE = 'jarvis-v2.1';
+const SHELL  = ['/'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  const url = new URL(e.request.url);
+  const isSameOrigin = url.origin === self.location.origin;
+  const isFont       = url.hostname.includes('fonts.googleapis.com') ||
+                       url.hostname.includes('fonts.gstatic.com');
+  if (!isSameOrigin && !isFont) return;
+
+  e.respondWith(
+    fetch(e.request)
+      .then(res => {
+        if (res.ok) {
+          const clone = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, clone));
+        }
+        return res;
+      })
+      .catch(() => caches.match(e.request))
+  );
+});
+"""
+
+# ══════════════════════════════════════════════════════════════════════
+# HTML PAGE  — Iron Man HUD v2
+# ══════════════════════════════════════════════════════════════════════
+
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
-  <title>J.A.R.V.I.S.</title>
-  <meta name="description" content="J.A.R.V.I.S. Cloud AI — Voice Assistant"/>
   <meta name="theme-color" content="#000814"/>
+  <meta name="description" content="J.A.R.V.I.S. — Personal AI Assistant"/>
+  <title>J.A.R.V.I.S.</title>
   <link rel="manifest" href="/manifest.json"/>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Rajdhani:wght@300;400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
   <style>
-    :root {
-      --bg:    #000814;
-      --blue:  #00d4ff;
-      --blue2: #0055ff;
-      --green: #00ff88;
-      --red:   #ff2255;
-      --amber: #ffaa00;
-      --text:  #90c8e8;
-      --muted: #1e3a5a;
-      --glow:  rgba(0,212,255,0.35);
+    :root{
+      --bg:#000814; --blue:#00d4ff; --blue2:#0055ff; --green:#00ff88;
+      --red:#ff2255; --amber:#ffaa00; --text:#90c8e8; --muted:#1e3a5a;
+      --glow:rgba(0,212,255,.35); --surface:rgba(0,15,50,.7);
     }
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     html{height:100%;background:var(--bg);}
     body{
-      height:100dvh; background:var(--bg); color:var(--text);
+      height:100dvh;background:var(--bg);color:var(--text);
       font-family:'Rajdhani',sans-serif;
-      display:flex; flex-direction:column; overflow:hidden;
-      -webkit-tap-highlight-color:transparent; user-select:none;
+      display:flex;flex-direction:column;overflow:hidden;
+      -webkit-tap-highlight-color:transparent;user-select:none;
     }
 
-    /* Background layers */
-    .bg-glow{
-      position:fixed;inset:0;pointer-events:none;z-index:0;
-      background:
-        radial-gradient(ellipse at 50% 0%,rgba(0,80,200,0.13) 0%,transparent 60%),
-        radial-gradient(ellipse at 50% 100%,rgba(0,30,100,0.1) 0%,transparent 55%);
-    }
-    .hex-grid{
-      position:fixed;inset:0;pointer-events:none;z-index:0;opacity:0.55;
-      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='48'%3E%3Cpath d='M28 2 L54 16 L54 32 L28 46 L2 32 L2 16 Z' fill='none' stroke='%23002255' stroke-width='0.8'/%3E%3C/svg%3E");
-      background-size:56px 48px;
-    }
-    .scanlines{
-      position:fixed;inset:0;pointer-events:none;z-index:0;
-      background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.04) 3px,rgba(0,0,0,0.04) 4px);
-    }
+    /* ── Backgrounds ── */
+    .bg-glow{position:fixed;inset:0;pointer-events:none;z-index:0;
+      background:radial-gradient(ellipse at 50% 0%,rgba(0,80,200,.13) 0%,transparent 60%),
+                 radial-gradient(ellipse at 50% 100%,rgba(0,30,100,.1) 0%,transparent 55%);}
+    .hex-grid{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.5;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='48'%3E%3Cpath d='M28 2 L54 16 L54 32 L28 46 L2 32 L2 16 Z' fill='none' stroke='%23002255' stroke-width='.8'/%3E%3C/svg%3E");
+      background-size:56px 48px;}
+    .scanlines{position:fixed;inset:0;pointer-events:none;z-index:0;
+      background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.04) 3px,rgba(0,0,0,.04) 4px);}
 
-    /* HUD Corners */
-    .hc{position:fixed;width:54px;height:54px;z-index:5;pointer-events:none;}
-    .hc::before,.hc::after{content:'';position:absolute;background:rgba(0,212,255,0.55);}
-    .hc.tl{top:0;left:0;}
-    .hc.tl::before{top:0;left:0;width:54px;height:2px;}
-    .hc.tl::after{top:0;left:0;width:2px;height:54px;}
-    .hc.tr{top:0;right:0;}
-    .hc.tr::before{top:0;right:0;width:54px;height:2px;}
-    .hc.tr::after{top:0;right:0;width:2px;height:54px;}
-    .hc.bl{bottom:0;left:0;}
-    .hc.bl::before{bottom:0;left:0;width:54px;height:2px;}
-    .hc.bl::after{bottom:0;left:0;width:2px;height:54px;}
-    .hc.br{bottom:0;right:0;}
-    .hc.br::before{bottom:0;right:0;width:54px;height:2px;}
-    .hc.br::after{bottom:0;right:0;width:2px;height:54px;}
+    /* ── HUD corners ── */
+    .hc{position:fixed;width:50px;height:50px;z-index:5;pointer-events:none;}
+    .hc::before,.hc::after{content:'';position:absolute;background:rgba(0,212,255,.55);}
+    .hc.tl{top:0;left:0;} .hc.tl::before{top:0;left:0;width:50px;height:2px;} .hc.tl::after{top:0;left:0;width:2px;height:50px;}
+    .hc.tr{top:0;right:0;} .hc.tr::before{top:0;right:0;width:50px;height:2px;} .hc.tr::after{top:0;right:0;width:2px;height:50px;}
+    .hc.bl{bottom:0;left:0;} .hc.bl::before{bottom:0;left:0;width:50px;height:2px;} .hc.bl::after{bottom:0;left:0;width:2px;height:50px;}
+    .hc.br{bottom:0;right:0;} .hc.br::before{bottom:0;right:0;width:50px;height:2px;} .hc.br::after{bottom:0;right:0;width:2px;height:50px;}
 
-    /* HEADER */
+    /* ── Offline banner ── */
+    .offline-bar{
+      position:relative;z-index:50;flex-shrink:0;
+      background:linear-gradient(90deg,#4a2000,#3a1800);
+      border-bottom:1px solid rgba(255,170,0,.35);
+      padding:7px 16px;display:none;
+      font-family:'Share Tech Mono',monospace;font-size:.65rem;letter-spacing:1.5px;
+      color:var(--amber);text-align:center;
+    }
+    .offline-bar.on{display:block;}
+
+    /* ── Install banner ── */
+    .install-bar{
+      position:relative;z-index:50;flex-shrink:0;
+      background:linear-gradient(90deg,rgba(0,50,120,.9),rgba(0,30,80,.9));
+      border-bottom:1px solid rgba(0,212,255,.2);
+      padding:9px 16px;display:none;
+      align-items:center;justify-content:space-between;gap:10px;
+    }
+    .install-bar.on{display:flex;}
+    .install-bar span{font-family:'Share Tech Mono',monospace;font-size:.65rem;letter-spacing:1px;color:var(--blue);}
+    .install-bar button{
+      padding:6px 14px;background:linear-gradient(135deg,var(--blue2),var(--blue));
+      border:none;border-radius:6px;color:#fff;font-size:.75rem;
+      font-family:'Rajdhani',sans-serif;font-weight:700;letter-spacing:1px;cursor:pointer;
+    }
+    .ib-close{background:none!important;border:1px solid var(--muted)!important;color:var(--muted)!important;padding:5px 10px!important;}
+
+    /* ── Header ── */
     .hud-header{
       position:relative;z-index:10;flex-shrink:0;
-      padding:14px 20px 10px;
-      background:linear-gradient(180deg,rgba(0,8,30,0.96) 0%,rgba(0,8,20,0.5) 100%);
-      border-bottom:1px solid rgba(0,212,255,0.12);
+      padding:12px 16px 8px;
+      background:linear-gradient(180deg,rgba(0,8,30,.97) 0%,rgba(0,8,20,.5) 100%);
+      border-bottom:1px solid rgba(0,212,255,.12);
     }
-    .hud-row1{display:flex;align-items:center;justify-content:space-between;}
+    .hud-row1{display:flex;align-items:center;justify-content:space-between;gap:8px;}
     .j-name{
-      font-family:'Orbitron',monospace;font-size:1.05rem;font-weight:900;
+      font-family:'Orbitron',monospace;font-size:1rem;font-weight:900;
       letter-spacing:5px;color:var(--blue);
-      text-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,0.3);
+      text-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,.3);
+      flex:1;
     }
-    .sys-badge{display:flex;align-items:center;gap:6px;
-      font-family:'Share Tech Mono',monospace;font-size:0.62rem;letter-spacing:2px;}
-    .led{
-      width:8px;height:8px;border-radius:50%;
-      background:var(--green);box-shadow:0 0 8px var(--green);
-      animation:led-blink 2s infinite;
+    .hdr-btns{display:flex;align-items:center;gap:8px;}
+    .hdr-btn{
+      background:none;border:1px solid var(--muted);color:var(--muted);
+      border-radius:6px;padding:5px 9px;cursor:pointer;
+      font-family:'Share Tech Mono',monospace;font-size:.7rem;letter-spacing:1px;
+      transition:all .15s;flex-shrink:0;
     }
-    .led.red  {background:var(--red);  box-shadow:0 0 8px var(--red);  animation:led-blink 0.5s infinite;}
-    .led.blue {background:var(--blue); box-shadow:0 0 8px var(--blue); animation:led-blink 0.35s infinite;}
-    @keyframes led-blink{0%,100%{opacity:1;}50%{opacity:0.15;}}
+    .hdr-btn:active{border-color:var(--blue);color:var(--blue);}
+    .sys-badge{display:flex;align-items:center;gap:6px;font-family:'Share Tech Mono',monospace;font-size:.62rem;letter-spacing:2px;}
+    .led{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:led-blink 2s infinite;}
+    .led.red{background:var(--red);box-shadow:0 0 8px var(--red);animation-duration:.5s;}
+    .led.blue{background:var(--blue);box-shadow:0 0 8px var(--blue);animation-duration:.35s;}
+    .led.amber{background:var(--amber);box-shadow:0 0 8px var(--amber);}
+    @keyframes led-blink{0%,100%{opacity:1;}50%{opacity:.15;}}
     .sys-lbl{color:var(--green);}
     .sys-lbl.red{color:var(--red);}
     .sys-lbl.blue{color:var(--blue);}
     .hud-meta{
-      margin-top:6px;display:flex;gap:14px;
-      font-family:'Share Tech Mono',monospace;font-size:0.58rem;
-      color:var(--muted);letter-spacing:0.5px;
+      margin-top:5px;display:flex;gap:12px;flex-wrap:wrap;
+      font-family:'Share Tech Mono',monospace;font-size:.56rem;
+      color:var(--muted);letter-spacing:.5px;
     }
-    .hud-meta .v{color:rgba(0,212,255,0.45);}
+    .hud-meta .v{color:rgba(0,212,255,.5);}
 
-    /* RESPONSE PANEL */
+    /* ── Response panel ── */
     .resp-area{
       flex:1;position:relative;z-index:10;
       display:flex;align-items:center;justify-content:center;
-      padding:14px 16px;overflow:hidden;
+      padding:12px 14px;overflow:hidden;
     }
     .holo-panel{
-      width:100%;max-width:460px;
-      background:rgba(0,15,50,0.6);
-      border:1px solid rgba(0,212,255,0.18);
-      border-radius:14px;padding:18px 20px 16px;
-      backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-      position:relative;
+      width:100%;max-width:500px;
+      background:rgba(0,12,40,.65);
+      border:1px solid rgba(0,212,255,.18);
+      border-radius:14px;padding:16px 18px 14px;
+      backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+      position:relative;max-height:100%;overflow-y:auto;
     }
+    .holo-panel::-webkit-scrollbar{width:3px;}
+    .holo-panel::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px;}
     .holo-panel::before{
-      content:'';position:absolute;top:-1px;left:22px;
-      width:48px;height:2px;
-      background:linear-gradient(90deg,var(--blue),transparent);
-      box-shadow:0 0 8px var(--blue);
+      content:'';position:absolute;top:-1px;left:20px;
+      width:44px;height:2px;
+      background:linear-gradient(90deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);
     }
     .holo-panel::after{
-      content:'';position:absolute;bottom:-1px;right:22px;
-      width:48px;height:2px;
-      background:linear-gradient(270deg,var(--blue),transparent);
-      box-shadow:0 0 8px var(--blue);
+      content:'';position:absolute;bottom:-1px;right:20px;
+      width:44px;height:2px;
+      background:linear-gradient(270deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);
     }
-    .panel-lbl{
-      font-family:'Orbitron',monospace;font-size:0.52rem;
-      letter-spacing:3px;color:rgba(0,212,255,0.45);margin-bottom:10px;
-    }
+    .panel-lbl{font-family:'Orbitron',monospace;font-size:.5rem;letter-spacing:3px;color:rgba(0,212,255,.45);margin-bottom:8px;}
     .query-line{
-      font-family:'Share Tech Mono',monospace;font-size:0.72rem;
-      color:var(--muted);margin-bottom:9px;padding-bottom:8px;
-      border-bottom:1px solid rgba(0,212,255,0.08);display:none;
+      font-family:'Share Tech Mono',monospace;font-size:.72rem;
+      color:var(--muted);margin-bottom:7px;padding-bottom:7px;
+      border-bottom:1px solid rgba(0,212,255,.08);display:none;
     }
     .query-line.on{display:block;}
-    .query-line::before{content:'> ';color:rgba(0,212,255,0.35);}
-    .resp-txt{font-size:1.1rem;line-height:1.65;color:var(--text);min-height:56px;}
-    .resp-txt.blink::after{content:'|';animation:cur-blink 0.6s infinite;color:var(--blue);margin-left:1px;}
+    .query-line::before{content:'> ';color:rgba(0,212,255,.35);}
+    .resp-txt{font-size:1.05rem;line-height:1.65;color:var(--text);min-height:44px;word-break:break-word;}
+    .resp-txt.blink::after{content:'|';animation:cur-blink .6s infinite;color:var(--blue);margin-left:1px;}
     @keyframes cur-blink{0%,100%{opacity:1;}50%{opacity:0;}}
     .tdots{display:none;gap:5px;margin-top:8px;}
     .tdots.on{display:flex;}
-    .tdots b{
-      width:6px;height:6px;border-radius:50%;
-      background:var(--blue);animation:td 1.2s infinite;
-    }
+    .tdots b{width:6px;height:6px;border-radius:50%;background:var(--blue);animation:td 1.2s infinite;}
     .tdots b:nth-child(2){animation-delay:.18s;}
     .tdots b:nth-child(3){animation-delay:.36s;}
     @keyframes td{0%,60%,100%{transform:translateY(0);opacity:.3;}30%{transform:translateY(-7px);opacity:1;}}
 
-    /* QUICK COMMANDS */
-    .quick-wrap{position:relative;z-index:10;padding:6px 14px;flex-shrink:0;}
-    .quick-inner{display:flex;gap:7px;overflow-x:auto;scrollbar-width:none;}
+    /* ── Code blocks ── */
+    .cb{background:rgba(0,5,20,.9);border:1px solid rgba(0,212,255,.2);border-radius:8px;margin:8px 0;overflow:hidden;}
+    .cb-hdr{
+      display:flex;align-items:center;justify-content:space-between;
+      padding:6px 12px;background:rgba(0,212,255,.06);
+      border-bottom:1px solid rgba(0,212,255,.15);
+    }
+    .cb-lang{font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:2px;color:var(--blue);}
+    .cb-copy{
+      background:none;border:1px solid rgba(0,212,255,.3);color:rgba(0,212,255,.7);
+      border-radius:4px;padding:2px 8px;cursor:pointer;
+      font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:1px;
+      transition:all .15s;
+    }
+    .cb-copy:active{background:rgba(0,212,255,.15);color:var(--blue);}
+    .cb pre{padding:12px;overflow-x:auto;}
+    .cb pre::-webkit-scrollbar{height:3px;}
+    .cb pre::-webkit-scrollbar-thumb{background:var(--muted);}
+    .cb code{font-family:'Share Tech Mono',monospace;font-size:.78rem;line-height:1.5;color:#9ae4ff;white-space:pre;}
+    code.ic{background:rgba(0,212,255,.1);color:#9ae4ff;padding:1px 5px;border-radius:3px;font-family:'Share Tech Mono',monospace;font-size:.85em;}
+
+    /* ── Quick commands ── */
+    .quick-wrap{position:relative;z-index:10;padding:5px 12px;flex-shrink:0;}
+    .quick-inner{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding-bottom:2px;}
     .quick-inner::-webkit-scrollbar{display:none;}
     .qc{
-      flex-shrink:0;
-      font-family:'Rajdhani',sans-serif;font-size:0.72rem;font-weight:600;letter-spacing:0.5px;
-      padding:7px 12px;border-radius:6px;
-      border:1px solid var(--muted);
-      background:rgba(0,15,45,0.55);
-      color:rgba(144,200,232,0.7);
-      cursor:pointer;white-space:nowrap;
-      transition:border-color 0.15s,color 0.15s,box-shadow 0.15s;
+      flex-shrink:0;font-family:'Rajdhani',sans-serif;font-size:.7rem;font-weight:600;letter-spacing:.5px;
+      padding:6px 11px;border-radius:6px;border:1px solid var(--muted);
+      background:rgba(0,15,45,.55);color:rgba(144,200,232,.7);cursor:pointer;white-space:nowrap;
+      transition:border-color .15s,color .15s;
     }
-    .qc:active{border-color:var(--blue);color:var(--blue);box-shadow:0 0 10px rgba(0,212,255,0.25);}
+    .qc:active{border-color:var(--blue);color:var(--blue);box-shadow:0 0 10px rgba(0,212,255,.2);}
 
-    /* MIC / ARC REACTOR */
+    /* ── Mic / Arc reactor ── */
     .mic-section{
       position:relative;z-index:10;flex-shrink:0;
       display:flex;flex-direction:column;align-items:center;
-      padding:10px 0;
-      padding-bottom:max(env(safe-area-inset-bottom,16px),16px);
-      gap:10px;
+      padding:8px 0 6px;gap:8px;
     }
-    .wave{display:flex;align-items:center;gap:3px;height:28px;opacity:0;transition:opacity 0.3s;}
+    .wave{display:flex;align-items:center;gap:3px;height:24px;opacity:0;transition:opacity .3s;}
     .wave.on{opacity:1;}
-    .wave i{display:block;width:3px;border-radius:2px;background:var(--red);box-shadow:0 0 5px var(--red);animation:wbar 0.9s ease-in-out infinite;}
-    .wave i:nth-child(1){height:8px;animation-delay:0s;}
-    .wave i:nth-child(2){height:18px;animation-delay:.08s;}
-    .wave i:nth-child(3){height:26px;animation-delay:.16s;}
-    .wave i:nth-child(4){height:14px;animation-delay:.24s;}
-    .wave i:nth-child(5){height:22px;animation-delay:.12s;}
-    .wave i:nth-child(6){height:16px;animation-delay:.08s;}
-    .wave i:nth-child(7){height:10px;animation-delay:0s;}
+    .wave i{display:block;width:3px;border-radius:2px;background:var(--red);box-shadow:0 0 5px var(--red);animation:wbar .9s ease-in-out infinite;}
+    .wave i:nth-child(1){height:7px;}
+    .wave i:nth-child(2){height:16px;animation-delay:.08s;}
+    .wave i:nth-child(3){height:23px;animation-delay:.16s;}
+    .wave i:nth-child(4){height:12px;animation-delay:.24s;}
+    .wave i:nth-child(5){height:20px;animation-delay:.12s;}
+    .wave i:nth-child(6){height:14px;animation-delay:.08s;}
+    .wave i:nth-child(7){height:9px;}
     @keyframes wbar{0%,100%{transform:scaleY(.3);}50%{transform:scaleY(1);}}
-
-    .arc-wrap{
-      position:relative;width:148px;height:148px;
-      display:flex;align-items:center;justify-content:center;
-    }
-    .ring{position:absolute;border-radius:50%;border:1px solid rgba(0,212,255,0.22);}
-    .r1{width:148px;height:148px;animation:rbreath 3s ease-in-out infinite;}
-    .r2{width:126px;height:126px;animation:rbreath 3s ease-in-out infinite 0.5s;border-color:rgba(0,212,255,0.13);}
+    .arc-wrap{position:relative;width:136px;height:136px;display:flex;align-items:center;justify-content:center;}
+    .ring{position:absolute;border-radius:50%;border:1px solid rgba(0,212,255,.22);}
+    .r1{width:136px;height:136px;animation:rbreath 3s ease-in-out infinite;}
+    .r2{width:116px;height:116px;animation:rbreath 3s ease-in-out infinite .5s;border-color:rgba(0,212,255,.13);}
     @keyframes rbreath{0%,100%{transform:scale(1);opacity:.5;}50%{transform:scale(1.05);opacity:1;}}
-
-    /* Listening state */
-    .arc-wrap.lst .r1{animation:rlisten 0.65s infinite;border-color:rgba(255,34,85,.75);}
-    .arc-wrap.lst .r2{animation:rlisten 0.65s infinite .15s;border-color:rgba(255,34,85,.4);}
+    .arc-wrap.lst .r1{animation:rlisten .65s infinite;border-color:rgba(255,34,85,.75);}
+    .arc-wrap.lst .r2{animation:rlisten .65s infinite .15s;border-color:rgba(255,34,85,.4);}
     @keyframes rlisten{0%,100%{transform:scale(1);}50%{transform:scale(1.11);}}
-
-    /* Thinking state */
-    .arc-wrap.thk .r1{animation:rspin 1.8s linear infinite;border-color:transparent;border-top-color:var(--blue);box-shadow:0 0 12px rgba(0,212,255,0.3);}
+    .arc-wrap.thk .r1{animation:rspin 1.8s linear infinite;border-color:transparent;border-top-color:var(--blue);box-shadow:0 0 12px rgba(0,212,255,.3);}
     .arc-wrap.thk .r2{animation:rspin 3s linear infinite reverse;border-color:transparent;border-top-color:var(--blue2);}
     @keyframes rspin{from{transform:rotate(0);}to{transform:rotate(360deg);}}
-
-    /* Arc reactor button */
     .arc-btn{
-      width:100px;height:100px;border-radius:50%;
-      background:radial-gradient(circle at 38% 38%,rgba(0,55,130,0.9),rgba(0,4,18,0.97));
-      border:2px solid rgba(0,212,255,0.45);
-      box-shadow:0 0 24px rgba(0,212,255,0.2),0 0 50px rgba(0,212,255,0.07),inset 0 0 24px rgba(0,212,255,0.07);
-      cursor:pointer;position:relative;
-      display:flex;align-items:center;justify-content:center;
-      transition:transform 0.15s,box-shadow 0.2s;
-      -webkit-appearance:none;outline:none;
+      width:92px;height:92px;border-radius:50%;
+      background:radial-gradient(circle at 38% 38%,rgba(0,55,130,.9),rgba(0,4,18,.97));
+      border:2px solid rgba(0,212,255,.45);
+      box-shadow:0 0 24px rgba(0,212,255,.2),inset 0 0 24px rgba(0,212,255,.07);
+      cursor:pointer;position:relative;display:flex;align-items:center;justify-content:center;
+      transition:transform .15s,box-shadow .2s;-webkit-appearance:none;outline:none;
     }
-    .arc-btn:active{transform:scale(0.93);}
-    .arc-btn::before{
-      content:'';position:absolute;width:52px;height:52px;
-      border-radius:50%;border:1.5px solid rgba(0,212,255,0.3);
-    }
+    .arc-btn:active{transform:scale(.93);}
+    .arc-btn::before{content:'';position:absolute;width:48px;height:48px;border-radius:50%;border:1.5px solid rgba(0,212,255,.3);}
     .arc-core{
-      width:22px;height:22px;border-radius:50%;
+      width:20px;height:20px;border-radius:50%;
       background:radial-gradient(circle,#9aeeff,var(--blue));
-      box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,0.35);
+      box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,.35);
       animation:core-glow 3s ease-in-out infinite;position:relative;z-index:1;
     }
-    @keyframes core-glow{0%,100%{box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,0.35);}50%{box-shadow:0 0 28px var(--blue),0 0 56px rgba(0,212,255,0.55);}}
-
-    .arc-wrap.lst .arc-btn{
-      border-color:rgba(255,34,85,.7);
-      box-shadow:0 0 28px rgba(255,34,85,.35),inset 0 0 24px rgba(255,34,85,.08);
-    }
+    @keyframes core-glow{0%,100%{box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,.35);}50%{box-shadow:0 0 28px var(--blue),0 0 56px rgba(0,212,255,.55);}}
+    .arc-wrap.lst .arc-btn{border-color:rgba(255,34,85,.7);box-shadow:0 0 28px rgba(255,34,85,.35),inset 0 0 24px rgba(255,34,85,.08);}
     .arc-wrap.lst .arc-btn::before{border-color:rgba(255,34,85,.45);}
-    .arc-wrap.lst .arc-core{
-      background:radial-gradient(circle,#ffaacc,var(--red));
-      box-shadow:0 0 18px var(--red),0 0 36px rgba(255,34,85,.35);animation:none;
-    }
-    .arc-wrap.thk .arc-btn{
-      box-shadow:0 0 36px rgba(0,212,255,.5),0 0 70px rgba(0,212,255,.2),inset 0 0 24px rgba(0,212,255,.12);
-    }
+    .arc-wrap.lst .arc-core{background:radial-gradient(circle,#ffaacc,var(--red));box-shadow:0 0 18px var(--red);animation:none;}
+    .arc-wrap.thk .arc-btn{box-shadow:0 0 36px rgba(0,212,255,.5),0 0 70px rgba(0,212,255,.2),inset 0 0 24px rgba(0,212,255,.12);}
     .arc-wrap.thk .arc-core{animation:core-spin 1s linear infinite;}
     @keyframes core-spin{to{filter:hue-rotate(360deg);}}
-
-    .mic-lbl{
-      font-family:'Orbitron',monospace;font-size:0.58rem;
-      letter-spacing:3px;color:var(--muted);text-align:center;transition:color 0.3s;
-    }
+    .mic-lbl{font-family:'Orbitron',monospace;font-size:.56rem;letter-spacing:3px;color:var(--muted);text-align:center;transition:color .3s;}
     .mic-lbl.red{color:var(--red);}
     .mic-lbl.blue{color:var(--blue);}
     .mic-lbl.green{color:var(--green);}
 
-    /* TOAST */
-    .toast{
-      position:fixed;top:78px;left:50%;
-      transform:translateX(-50%) translateY(-10px);
-      background:rgba(0,15,50,0.96);border:1px solid rgba(0,212,255,0.3);
-      border-radius:8px;padding:8px 18px;
-      font-family:'Share Tech Mono',monospace;font-size:0.68rem;
-      color:var(--blue);letter-spacing:1px;
-      z-index:200;opacity:0;transition:all 0.25s;
-      pointer-events:none;white-space:nowrap;
+    /* ── Text input bar ── */
+    .input-bar{
+      position:relative;z-index:10;flex-shrink:0;
+      padding:8px 14px max(env(safe-area-inset-bottom,12px),12px);
+      background:rgba(0,6,22,.95);border-top:1px solid rgba(0,212,255,.1);
+      display:flex;gap:8px;align-items:center;
     }
-    .toast.on{opacity:1;transform:translateX(-50%) translateY(0);}
+    #txtIn{
+      flex:1;background:rgba(0,12,40,.8);border:1px solid rgba(0,212,255,.2);
+      border-radius:22px;padding:10px 16px;
+      color:var(--text);font-size:.9rem;font-family:'Rajdhani',sans-serif;
+      outline:none;transition:border-color .2s,box-shadow .2s;
+    }
+    #txtIn:focus{border-color:rgba(0,212,255,.5);box-shadow:0 0 0 3px rgba(0,212,255,.08);}
+    #txtIn::placeholder{color:var(--muted);}
+    .send-btn{
+      width:42px;height:42px;border-radius:50%;border:none;cursor:pointer;flex-shrink:0;
+      background:linear-gradient(135deg,var(--blue2),var(--blue));
+      color:#fff;font-size:1rem;display:flex;align-items:center;justify-content:center;
+      box-shadow:0 2px 12px rgba(0,212,255,.3);transition:transform .15s;
+    }
+    .send-btn:active{transform:scale(.9);}
 
-    /* NO VOICE */
-    #noVoice{
-      display:none;position:fixed;inset:0;z-index:300;
-      background:rgba(0,0,0,0.93);
-      flex-direction:column;align-items:center;justify-content:center;
-      gap:16px;padding:32px;text-align:center;
+    /* ── Controls drawer ── */
+    .drawer-overlay{
+      position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.6);
+      display:none;backdrop-filter:blur(4px);
     }
-    #noVoice.on{display:flex;}
-    #noVoice h2{font-family:'Orbitron',monospace;font-size:1rem;letter-spacing:2px;color:var(--red);}
-    #noVoice p{color:var(--muted);font-size:0.9rem;line-height:1.6;}
+    .drawer-overlay.on{display:block;}
+    .drawer{
+      position:fixed;bottom:0;left:0;right:0;z-index:101;
+      background:rgba(0,6,22,.97);border-top:1px solid rgba(0,212,255,.25);
+      border-radius:20px 20px 0 0;
+      padding:20px 20px max(env(safe-area-inset-bottom,20px),20px);
+      transform:translateY(110%);transition:transform .35s cubic-bezier(.4,0,.2,1);
+      max-height:80vh;overflow-y:auto;
+    }
+    .drawer.on{transform:translateY(0);}
+    .drawer-pill{width:40px;height:4px;background:var(--muted);border-radius:2px;margin:0 auto 18px;}
+    .drawer-hdr{
+      display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;
+      font-family:'Orbitron',monospace;font-size:.58rem;letter-spacing:3px;color:var(--blue);
+    }
+    .drawer-hdr button{
+      background:none;border:1px solid var(--muted);color:var(--muted);
+      border-radius:5px;padding:3px 8px;cursor:pointer;font-size:.75rem;transition:all .15s;
+    }
+    .drawer-hdr button:active{border-color:var(--red);color:var(--red);}
+    .ctrl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px;}
+    .ctrl-tile{
+      background:rgba(0,15,50,.7);border:1px solid var(--muted);
+      border-radius:12px;padding:16px 10px;cursor:pointer;
+      display:flex;flex-direction:column;align-items:center;gap:7px;
+      font-family:'Rajdhani',sans-serif;font-size:.72rem;font-weight:600;letter-spacing:.5px;
+      color:rgba(144,200,232,.7);transition:all .2s;
+    }
+    .ctrl-tile:active,.ctrl-tile.active{
+      border-color:var(--blue);color:var(--blue);
+      background:rgba(0,212,255,.08);box-shadow:0 0 12px rgba(0,212,255,.2);
+    }
+    .ctrl-tile span:first-child{font-size:1.4rem;}
+    .ctrl-section-lbl{
+      font-family:'Share Tech Mono',monospace;font-size:.58rem;letter-spacing:2px;
+      color:var(--muted);margin-bottom:10px;
+    }
+    .local-pc-row{display:flex;gap:8px;align-items:center;}
+    .local-pc-row input{
+      flex:1;background:rgba(0,12,40,.8);border:1px solid rgba(0,212,255,.2);
+      border-radius:8px;padding:9px 12px;color:var(--text);
+      font-family:'Share Tech Mono',monospace;font-size:.75rem;outline:none;
+    }
+    .local-pc-row input:focus{border-color:rgba(0,212,255,.5);}
+    .local-pc-row input::placeholder{color:var(--muted);}
+    .local-pc-row button{
+      padding:9px 14px;background:linear-gradient(135deg,var(--blue2),var(--blue));
+      border:none;border-radius:8px;color:#fff;font-size:.75rem;
+      font-family:'Rajdhani',sans-serif;font-weight:700;letter-spacing:1px;cursor:pointer;
+    }
 
-    /* VOICE PICKER MODAL */
-    .vmodal{
-      display:none;position:fixed;inset:0;z-index:400;
-      background:rgba(0,0,0,0.82);
-      align-items:flex-end;justify-content:center;
-    }
+    /* ── Voice picker modal ── */
+    .vmodal{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:flex-end;justify-content:center;}
     .vmodal.on{display:flex;}
     .vmodal-inner{
-      width:100%;max-width:480px;
-      background:#00060f;
-      border:1px solid rgba(0,212,255,0.25);
-      border-bottom:none;border-radius:16px 16px 0 0;
-      padding:20px;max-height:72vh;
-      display:flex;flex-direction:column;
+      width:100%;max-width:480px;background:#00060f;
+      border:1px solid rgba(0,212,255,.25);border-bottom:none;border-radius:16px 16px 0 0;
+      padding:18px;max-height:70vh;display:flex;flex-direction:column;
     }
     .vmodal-hdr{
       display:flex;justify-content:space-between;align-items:center;
-      font-family:'Orbitron',monospace;font-size:0.62rem;
-      letter-spacing:3px;color:var(--blue);margin-bottom:14px;flex-shrink:0;
+      font-family:'Orbitron',monospace;font-size:.58rem;letter-spacing:3px;color:var(--blue);margin-bottom:12px;flex-shrink:0;
     }
-    .vmodal-hdr button{
-      background:none;border:1px solid var(--muted);color:var(--muted);
-      border-radius:4px;padding:3px 8px;cursor:pointer;font-size:0.8rem;
-      transition:all 0.15s;
-    }
-    .vmodal-hdr button:active{border-color:var(--red);color:var(--red);}
-    .vlist{
-      overflow-y:auto;display:flex;flex-direction:column;gap:6px;
-      scrollbar-width:thin;scrollbar-color:var(--muted) transparent;
-    }
-    .vlist::-webkit-scrollbar{width:3px;}
-    .vlist::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px;}
-    .vitem{
-      padding:12px 14px;border-radius:8px;
-      border:1px solid var(--muted);
-      cursor:pointer;transition:all 0.15s;
-      font-family:'Rajdhani',sans-serif;
-    }
-    .vitem:active,.vitem.sel{
-      border-color:var(--blue);color:var(--blue);
-      background:rgba(0,212,255,0.06);
-      box-shadow:0 0 10px rgba(0,212,255,0.15);
-    }
-    .vitem .vn{font-size:0.9rem;font-weight:600;color:var(--text);}
+    .vmodal-hdr button{background:none;border:1px solid var(--muted);color:var(--muted);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:.8rem;}
+    .vlist{overflow-y:auto;display:flex;flex-direction:column;gap:5px;scrollbar-width:thin;scrollbar-color:var(--muted) transparent;}
+    .vitem{padding:11px 13px;border-radius:8px;border:1px solid var(--muted);cursor:pointer;transition:all .15s;font-family:'Rajdhani',sans-serif;}
+    .vitem:active,.vitem.sel{border-color:var(--blue);color:var(--blue);background:rgba(0,212,255,.06);}
+    .vitem .vn{font-size:.88rem;font-weight:600;color:var(--text);}
     .vitem.sel .vn{color:var(--blue);}
-    .vitem .vl{font-size:0.65rem;font-family:'Share Tech Mono',monospace;color:var(--muted);margin-top:2px;}
-    .sel-mark{float:right;color:var(--green);font-size:0.8rem;display:none;}
+    .vitem .vl{font-size:.62rem;font-family:'Share Tech Mono',monospace;color:var(--muted);margin-top:2px;}
+    .sel-mark{float:right;color:var(--green);font-size:.8rem;display:none;}
     .vitem.sel .sel-mark{display:inline;}
 
-    /* Voice button in header */
-    .vbtn{
-      background:none;border:1px solid var(--muted);
-      color:var(--muted);border-radius:6px;
-      padding:4px 9px;cursor:pointer;font-size:0.78rem;
-      transition:all 0.15s;letter-spacing:1px;
-      font-family:'Share Tech Mono',monospace;
+    /* ── Toast ── */
+    .toast{
+      position:fixed;top:74px;left:50%;
+      transform:translateX(-50%) translateY(-10px);
+      background:rgba(0,15,50,.97);border:1px solid rgba(0,212,255,.3);
+      border-radius:8px;padding:7px 18px;
+      font-family:'Share Tech Mono',monospace;font-size:.65rem;
+      color:var(--blue);letter-spacing:1px;
+      z-index:300;opacity:0;transition:all .25s;pointer-events:none;white-space:nowrap;
     }
-    .vbtn:active{border-color:var(--blue);color:var(--blue);}
+    .toast.on{opacity:1;transform:translateX(-50%) translateY(0);}
+
+    /* ── No voice overlay ── */
+    #noVoice{
+      display:none;position:fixed;inset:0;z-index:400;
+      background:rgba(0,0,0,.93);flex-direction:column;
+      align-items:center;justify-content:center;gap:14px;padding:32px;text-align:center;
+    }
+    #noVoice.on{display:flex;}
+    #noVoice h2{font-family:'Orbitron',monospace;font-size:.95rem;letter-spacing:2px;color:var(--red);}
+    #noVoice p{color:var(--muted);font-size:.88rem;line-height:1.6;}
 
     @media(min-height:700px){
-      .arc-wrap{width:164px;height:164px;}
-      .r1{width:164px;height:164px;}
-      .r2{width:140px;height:140px;}
-      .arc-btn{width:112px;height:112px;}
+      .arc-wrap{width:152px;height:152px;}
+      .r1{width:152px;height:152px;}
+      .r2{width:130px;height:130px;}
+      .arc-btn{width:104px;height:104px;}
+    }
+    @media(max-height:600px){
+      .mic-section{padding:4px 0;}
+      .wave{display:none;}
     }
   </style>
 </head>
@@ -624,11 +810,25 @@ HTML_PAGE = """
 <div class="hc tl"></div><div class="hc tr"></div>
 <div class="hc bl"></div><div class="hc br"></div>
 
+<!-- Offline banner -->
+<div class="offline-bar" id="offlineBar">⚠ OFFLINE MODE — CLOUD UNREACHABLE · USING LOCAL FALLBACK</div>
+
+<!-- Install banner -->
+<div class="install-bar" id="installBar">
+  <span>📱 ADD J.A.R.V.I.S. TO HOME SCREEN</span>
+  <div style="display:flex;gap:8px;">
+    <button onclick="installApp()" id="installBtn">INSTALL</button>
+    <button class="ib-close" onclick="dismissInstall()">✕</button>
+  </div>
+</div>
+
+<!-- Header -->
 <header class="hud-header">
   <div class="hud-row1">
     <div class="j-name">J.A.R.V.I.S.</div>
-    <div style="display:flex;align-items:center;gap:10px;">
-      <button class="vbtn" onclick="openVoicePicker()" title="Change Voice">&#128266; VOICE</button>
+    <div class="hdr-btns">
+      <button class="hdr-btn" onclick="openVoicePicker()" title="Change voice">🔊 VOICE</button>
+      <button class="hdr-btn" onclick="openDrawer()" title="System controls">⚙ CTRL</button>
       <div class="sys-badge">
         <div class="led" id="led"></div>
         <span class="sys-lbl" id="sysLbl">ONLINE</span>
@@ -637,38 +837,41 @@ HTML_PAGE = """
   </div>
   <div class="hud-meta">
     <span>SYS&nbsp;<span class="v">NOMINAL</span></span>
-    <span>AI&nbsp;<span class="v">GROQ&nbsp;LLM</span></span>
+    <span>AI&nbsp;<span class="v" id="aiModel">GEMINI+GROQ</span></span>
     <span>MEM&nbsp;<span class="v">ACTIVE</span></span>
-    <span>NET&nbsp;<span class="v">CLOUD</span></span>
+    <span>NET&nbsp;<span class="v" id="netStatus">CLOUD</span></span>
   </div>
 </header>
 
+<!-- Response panel -->
 <div class="resp-area">
   <div class="holo-panel">
-    <div class="panel-lbl">&#9672; JARVIS OUTPUT</div>
+    <div class="panel-lbl">◈ JARVIS OUTPUT</div>
     <div class="query-line" id="qLine"></div>
     <div class="resp-txt" id="rTxt">Initialising systems&hellip;</div>
     <div class="tdots" id="tDots"><b></b><b></b><b></b></div>
   </div>
 </div>
 
+<!-- Quick commands -->
 <div class="quick-wrap">
   <div class="quick-inner">
-    <button class="qc" id="qc1" onclick="runCmd('world news')">&#127758; NEWS</button>
-    <button class="qc" id="qc2" onclick="runCmd('weather today')">&#127748; WEATHER</button>
-    <button class="qc" id="qc3" onclick="runCmd('open youtube')">&#9654; YOUTUBE</button>
-    <button class="qc" id="qc4" onclick="runCmd('open maps')">&#128506; MAPS</button>
-    <button class="qc" id="qc5" onclick="runCmd('open whatsapp')">&#128172; WHATSAPP</button>
-    <button class="qc" id="qc6" onclick="runCmd('open spotify')">&#127925; SPOTIFY</button>
-    <button class="qc" id="qc7" onclick="runCmd('motivate me')">&#9889; MOTIVATE</button>
-    <button class="qc" id="qc8" onclick="runCmd('tell me a joke')">&#128516; JOKE</button>
-    <button class="qc" id="qc9" onclick="runCmd('what time is it')">&#128336; TIME</button>
-    <button class="qc" id="qc10" onclick="runCmd('open instagram')">&#128247; INSTAGRAM</button>
-    <button class="qc" id="qc11" onclick="runCmd('open netflix')">&#127909; NETFLIX</button>
-    <button class="qc" id="qc12" onclick="runCmd('open calculator')">&#129518; CALC</button>
+    <button class="qc" id="qc1" onclick="runCmd('world news')">🌍 NEWS</button>
+    <button class="qc" id="qc2" onclick="runCmd('weather today')">🌤 WEATHER</button>
+    <button class="qc" id="qc3" onclick="runCmd('open youtube')">▶ YOUTUBE</button>
+    <button class="qc" id="qc4" onclick="runCmd('open whatsapp')">💬 WHATSAPP</button>
+    <button class="qc" id="qc5" onclick="runCmd('open spotify')">🎵 SPOTIFY</button>
+    <button class="qc" id="qc6" onclick="runCmd('open maps')">🗺 MAPS</button>
+    <button class="qc" id="qc7" onclick="runCmd('what time is it')">🕐 TIME</button>
+    <button class="qc" id="qc8" onclick="runCmd('motivate me')">⚡ MOTIVATE</button>
+    <button class="qc" id="qc9" onclick="runCmd('tell me a joke')">😄 JOKE</button>
+    <button class="qc" id="qc10" onclick="runCmd('open instagram')">📸 INSTAGRAM</button>
+    <button class="qc" id="qc11" onclick="runCmd('open netflix')">🎬 NETFLIX</button>
+    <button class="qc" id="qc12" onclick="runCmd('open github')">💻 GITHUB</button>
   </div>
 </div>
 
+<!-- Arc reactor -->
 <div class="mic-section">
   <div class="wave" id="wave">
     <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
@@ -683,234 +886,594 @@ HTML_PAGE = """
   <div class="mic-lbl" id="micLbl">TAP TO SPEAK</div>
 </div>
 
-<div class="toast" id="toast"></div>
+<!-- Text input bar -->
+<div class="input-bar">
+  <input id="txtIn" type="text" placeholder="Type a command…" autocomplete="off" autocorrect="off"/>
+  <button class="send-btn" onclick="sendTyped()" title="Send">➤</button>
+</div>
 
-<!-- Voice picker modal -->
+<!-- Controls drawer -->
+<div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-pill"></div>
+  <div class="drawer-hdr">
+    <span>⚙ SYSTEM CONTROLS</span>
+    <button onclick="closeDrawer()">✕ CLOSE</button>
+  </div>
+
+  <div class="ctrl-grid">
+    <button class="ctrl-tile" id="torchTile" onclick="toggleTorch()">
+      <span>🔦</span><span>TORCH</span>
+    </button>
+    <button class="ctrl-tile" onclick="doVibrate()">
+      <span>📳</span><span>VIBRATE</span>
+    </button>
+    <button class="ctrl-tile" id="wakeTile" onclick="toggleWakeLock()">
+      <span>💡</span><span>WAKE LOCK</span>
+    </button>
+    <button class="ctrl-tile" onclick="showBattery()">
+      <span>🔋</span><span>BATTERY</span>
+    </button>
+    <button class="ctrl-tile" onclick="copyLast()">
+      <span>📋</span><span>COPY</span>
+    </button>
+    <button class="ctrl-tile" onclick="shareLast()">
+      <span>📤</span><span>SHARE</span>
+    </button>
+  </div>
+
+  <div class="ctrl-section-lbl">LOCAL PC FALLBACK (Ollama / jarvis_web.py)</div>
+  <div class="local-pc-row">
+    <input id="pcIpIn" type="text" placeholder="e.g. 192.168.1.5:5000"/>
+    <button onclick="saveLocalPC()">SAVE</button>
+  </div>
+</div>
+
+<!-- Voice picker -->
 <div class="vmodal" id="vModal">
   <div class="vmodal-inner">
     <div class="vmodal-hdr">
-      <span>&#128266; SELECT JARVIS VOICE</span>
-      <button onclick="closeVoicePicker()">&#10005; CLOSE</button>
+      <span>🔊 SELECT JARVIS VOICE</span>
+      <button onclick="closeVoicePicker()">✕ CLOSE</button>
     </div>
     <div class="vlist" id="vList"></div>
   </div>
 </div>
 
+<!-- No voice overlay -->
 <div id="noVoice">
-  <h2>&#9888; VOICE NOT SUPPORTED</h2>
-  <p>Please use <strong>Chrome on Android</strong><br>or <strong>Safari on iOS</strong> for voice input.</p>
+  <h2>⚠ VOICE NOT SUPPORTED</h2>
+  <p>Please use <strong>Chrome on Android</strong><br>or <strong>Safari on iOS</strong>.<br><br>You can still type commands below.</p>
 </div>
 
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
 <script>
-  'use strict';
-  const arcWrap = document.getElementById('arcWrap');
-  const micLbl  = document.getElementById('micLbl');
-  const led     = document.getElementById('led');
-  const sysLbl  = document.getElementById('sysLbl');
-  const rTxt    = document.getElementById('rTxt');
-  const qLine   = document.getElementById('qLine');
-  const tDots   = document.getElementById('tDots');
-  const waveEl  = document.getElementById('wave');
-  const toastEl = document.getElementById('toast');
+'use strict';
 
-  const synth = window.speechSynthesis;
-  let voices  = [];
-  let selVoice = null;
+// ── DOM refs ──────────────────────────────────────────────────────────────
+const arcWrap = document.getElementById('arcWrap');
+const micLbl  = document.getElementById('micLbl');
+const led     = document.getElementById('led');
+const sysLbl  = document.getElementById('sysLbl');
+const rTxt    = document.getElementById('rTxt');
+const qLine   = document.getElementById('qLine');
+const tDots   = document.getElementById('tDots');
+const waveEl  = document.getElementById('wave');
+const toastEl = document.getElementById('toast');
 
-  function loadVoices(){
-    voices = synth.getVoices();
-    // Restore saved voice preference
-    const saved = localStorage.getItem('jarvisVoiceURI');
-    if(saved && !selVoice){
-      const found = voices.find(v=>v.voiceURI===saved);
-      if(found) selVoice = found;
+// ── Voice synthesis ───────────────────────────────────────────────────────
+const synth = window.speechSynthesis;
+let voices  = [];
+let selVoice = null;
+
+// Male voice priority order
+const MALE_TESTS = [
+  v => /google uk english male/i.test(v.name),
+  v => /google (us|en-us) english male/i.test(v.name),
+  v => /daniel/i.test(v.name) && /^en/i.test(v.lang),
+  v => /alex|mark|james|ryan|guy|fred|thomas|arthur/i.test(v.name) && /^en/i.test(v.lang),
+  v => /male/i.test(v.name) && /^en/i.test(v.lang),
+  v => /^en-IN/i.test(v.lang) && !/female|zira|siri|google uk english female/i.test(v.name),
+  v => /^en-GB/i.test(v.lang) && !/female|zira/i.test(v.name),
+  v => /^en/i.test(v.lang) && !/female|zira|karen|moira|samantha|tessa|veena/i.test(v.name),
+];
+
+function loadVoices() {
+  voices = synth.getVoices();
+  const saved = localStorage.getItem('jarvisVoiceURI');
+  if (saved && !selVoice) {
+    const f = voices.find(v => v.voiceURI === saved);
+    if (f) { selVoice = f; return; }
+  }
+  // Auto-pick best male voice if not saved
+  if (!selVoice || selVoice._auto) {
+    for (const test of MALE_TESTS) {
+      const v = voices.find(test);
+      if (v) { selVoice = v; selVoice._auto = true; break; }
+    }
+    if (!selVoice && voices.length > 0) {
+      selVoice = voices.find(v => /^en/i.test(v.lang)) || voices[0];
+      selVoice._auto = true;
     }
   }
-  if(synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
-  loadVoices();
+}
+if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
+loadVoices();
 
-  function getBestVoice(){
-    if(selVoice) return selVoice;
-    return voices.find(v=>v.lang.startsWith('en')&&/daniel|alex|mark|google uk english male/i.test(v.name))
-        || voices.find(v=>v.lang.startsWith('en-')&&/male/i.test(v.name))
-        || voices.find(v=>v.lang.startsWith('en'))
-        || null;
-  }
+function speak(text) {
+  if (!synth) return;
+  synth.cancel();
+  // Strip markdown for TTS
+  const plain = text
+    .replace(/```[\s\S]*?```/g, ' code block. ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/#{1,6}\s/g, '')
+    .replace(/\n/g, ' ')
+    .trim();
+  const u = new SpeechSynthesisUtterance(plain);
+  u.rate = 0.92; u.pitch = 0.82; u.volume = 1;
+  if (selVoice) u.voice = selVoice;
+  // Workaround for Chrome Android bug (voice resets)
+  setTimeout(() => { if (selVoice) u.voice = selVoice; synth.speak(u); }, 50);
+}
 
-  // ── Voice Picker ─────────────────────────────────────────
-  function openVoicePicker(){
-    const modal = document.getElementById('vModal');
-    const list  = document.getElementById('vList');
-    list.innerHTML = '';
-    // Reload voices in case they weren't ready
-    if(voices.length===0) loadVoices();
-    const engVoices = voices.filter(v=>v.lang.toLowerCase().startsWith('en'));
-    if(engVoices.length===0){
-      list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No voices loaded yet.<br>Wait a moment and try again.</p>';
+// ── Service Worker (PWA) ──────────────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(e => console.log('SW:', e));
+}
+
+// ── Offline detection ─────────────────────────────────────────────────────
+const offlineBar = document.getElementById('offlineBar');
+const netStat    = document.getElementById('netStatus');
+
+function updateOnlineStatus() {
+  const online = navigator.onLine;
+  offlineBar.className = online ? 'offline-bar' : 'offline-bar on';
+  netStat.textContent  = online ? 'CLOUD' : 'OFFLINE';
+}
+window.addEventListener('online',  updateOnlineStatus);
+window.addEventListener('offline', updateOnlineStatus);
+updateOnlineStatus();
+
+// Local PC IP (for Ollama fallback)
+const pcIpIn = document.getElementById('pcIpIn');
+pcIpIn.value = localStorage.getItem('jarvisLocalPC') || '';
+
+function saveLocalPC() {
+  const v = pcIpIn.value.trim();
+  if (v) { localStorage.setItem('jarvisLocalPC', v); showToast('LOCAL PC SAVED: ' + v); }
+  else  { localStorage.removeItem('jarvisLocalPC'); showToast('LOCAL PC CLEARED'); }
+}
+
+function getLocalPC() { return localStorage.getItem('jarvisLocalPC') || ''; }
+
+// ── Battery ───────────────────────────────────────────────────────────────
+async function showBattery() {
+  let info = 'Battery API not supported on this browser.';
+  try {
+    if ('getBattery' in navigator) {
+      const b = await navigator.getBattery();
+      const lvl = Math.round(b.level * 100);
+      const state = b.charging ? '⚡ Charging' : (b.discharging ? '🔋 Discharging' : '');
+      const eta = b.chargingTime && b.chargingTime !== Infinity
+        ? ` — full in ${Math.round(b.chargingTime/60)} min` : '';
+      info = `Battery: ${lvl}% ${state}${eta}`;
+    }
+  } catch(e) { info = 'Battery status unavailable: ' + e.message; }
+  showResponse(info);
+  speak(info);
+  closeDrawer();
+}
+
+// ── Wake lock ─────────────────────────────────────────────────────────────
+let wakeLock = null;
+const wakeTile = document.getElementById('wakeTile');
+async function toggleWakeLock() {
+  try {
+    if (wakeLock) {
+      await wakeLock.release(); wakeLock = null;
+      wakeTile.classList.remove('active');
+      showToast('WAKE LOCK RELEASED');
     } else {
-      engVoices.forEach(v=>{
-        const item = document.createElement('div');
-        const isSel = selVoice && selVoice.voiceURI===v.voiceURI;
-        item.className = 'vitem'+(isSel?' sel':'');
-        item.innerHTML = '<span class="vn">'+v.name+'<span class="sel-mark"> &#10003;</span></span>'
-          +'<div class="vl">'+v.lang+(v.localService?' &bull; LOCAL':' &bull; NETWORK')+'</div>';
-        item.onclick = ()=>{
-          selVoice = v;
-          localStorage.setItem('jarvisVoiceURI', v.voiceURI);
-          closeVoicePicker();
-          // Play preview
-          synth.cancel();
-          const u = new SpeechSynthesisUtterance('Voice confirmed. I am J.A.R.V.I.S., at your service.');
-          u.voice=v; u.rate=0.92; u.pitch=0.85; u.volume=1;
-          synth.speak(u);
-          showToast('VOICE SET: '+v.name.toUpperCase());
-        };
-        list.appendChild(item);
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeTile.classList.add('active');
+      showToast('SCREEN WAKE LOCK ACTIVE');
+      wakeLock.addEventListener('release', () => {
+        wakeLock = null; wakeTile.classList.remove('active');
       });
     }
-    modal.classList.add('on');
+  } catch(e) { showToast('WAKE LOCK: ' + e.message.toUpperCase()); }
+}
+
+// ── Torch ─────────────────────────────────────────────────────────────────
+let torchStream = null;
+let torchTrack  = null;
+let torchOn     = false;
+const torchTile = document.getElementById('torchTile');
+async function toggleTorch() {
+  if (torchOn) {
+    try { await torchTrack?.applyConstraints({advanced: [{torch: false}]}); } catch(_){}
+    torchTrack?.stop();
+    torchStream?.getTracks().forEach(t => t.stop());
+    torchStream = torchTrack = null; torchOn = false;
+    torchTile.classList.remove('active');
+    showToast('TORCH OFF');
+    return;
   }
-  function closeVoicePicker(){
-    document.getElementById('vModal').classList.remove('on');
-  }
-  // Close modal on backdrop tap
-  document.getElementById('vModal').addEventListener('click', function(e){
-    if(e.target===this) closeVoicePicker();
+  try {
+    torchStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment'}});
+    torchTrack  = torchStream.getVideoTracks()[0];
+    const caps  = torchTrack.getCapabilities?.() || {};
+    if ('torch' in caps) {
+      await torchTrack.applyConstraints({advanced: [{torch: true}]});
+      torchOn = true; torchTile.classList.add('active');
+      showToast('TORCH ON');
+    } else {
+      torchTrack.stop(); torchStream.getTracks().forEach(t => t.stop());
+      torchStream = torchTrack = null;
+      showToast('TORCH NOT SUPPORTED ON THIS DEVICE');
+    }
+  } catch(e) { showToast('CAMERA ACCESS DENIED'); }
+}
+
+// ── Vibrate ───────────────────────────────────────────────────────────────
+function doVibrate() {
+  if ('vibrate' in navigator) {
+    navigator.vibrate([150, 80, 150]);
+    showToast('VIBRATING');
+  } else { showToast('VIBRATION NOT SUPPORTED'); }
+}
+
+// ── Copy / Share last response ────────────────────────────────────────────
+let lastReply = '';
+function copyLast() {
+  if (!lastReply) { showToast('NOTHING TO COPY'); return; }
+  navigator.clipboard?.writeText(lastReply).then(() => showToast('COPIED TO CLIPBOARD'))
+    .catch(() => showToast('CLIPBOARD UNAVAILABLE'));
+}
+function shareLast() {
+  if (!lastReply) { showToast('NOTHING TO SHARE'); return; }
+  navigator.share?.({title: 'J.A.R.V.I.S.', text: lastReply})
+    .catch(() => showToast('SHARE CANCELLED'));
+}
+
+// ── Controls drawer ───────────────────────────────────────────────────────
+const drawer        = document.getElementById('drawer');
+const drawerOverlay = document.getElementById('drawerOverlay');
+function openDrawer()  { drawer.classList.add('on'); drawerOverlay.classList.add('on'); }
+function closeDrawer() { drawer.classList.remove('on'); drawerOverlay.classList.remove('on'); }
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+let _toastTimer = null;
+function showToast(msg) {
+  toastEl.textContent = msg; toastEl.classList.add('on');
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => toastEl.classList.remove('on'), 3200);
+}
+
+// ── Markdown / code rendering ─────────────────────────────────────────────
+function renderMarkdown(text) {
+  // Escape HTML first
+  let t = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Code blocks
+  let cbIdx = 0;
+  t = t.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const id = 'cb' + (cbIdx++);
+    const l  = lang || 'code';
+    // Need to un-escape the code content for display
+    return `<div class="cb"><div class="cb-hdr"><span class="cb-lang">${l.toUpperCase()}</span><button class="cb-copy" onclick="copyCb('${id}')">COPY</button></div><pre><code id="${id}">${code.trim()}</code></pre></div>`;
   });
 
-  function speak(text){
-    if(!synth) return;
-    synth.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate=0.92; u.pitch=0.85; u.volume=1;
-    const pick = getBestVoice();
-    if(pick) u.voice=pick;
-    synth.speak(u);
-  }
+  // Inline code
+  t = t.replace(/`([^`\n]+)`/g, '<code class="ic">$1</code>');
+  // Bold
+  t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  // Newlines
+  t = t.replace(/\n/g, '<br>');
+  return t;
+}
 
-  let appState='idle';
-  function setState(s){
-    appState=s;
-    arcWrap.className='arc-wrap'+(s==='listening'?' lst':s==='thinking'?' thk':'');
-    waveEl.className='wave'+(s==='listening'?' on':'');
-    tDots.className='tdots'+(s==='thinking'?' on':'');
-    if(s==='idle'){
-      micLbl.textContent='TAP TO SPEAK'; micLbl.className='mic-lbl';
-      led.className='led'; sysLbl.textContent='ONLINE'; sysLbl.className='sys-lbl';
-    } else if(s==='listening'){
-      micLbl.textContent='LISTENING...'; micLbl.className='mic-lbl red';
-      led.className='led red'; sysLbl.textContent='LISTENING'; sysLbl.className='sys-lbl red';
-    } else if(s==='thinking'){
-      micLbl.textContent='PROCESSING...'; micLbl.className='mic-lbl blue';
-      led.className='led blue'; sysLbl.textContent='THINKING'; sysLbl.className='sys-lbl blue';
-    } else if(s==='speaking'){
-      micLbl.textContent='RESPONDING...'; micLbl.className='mic-lbl green';
-      led.className='led'; sysLbl.textContent='ONLINE'; sysLbl.className='sys-lbl';
-    }
-  }
+function copyCb(id) {
+  const el = document.getElementById(id);
+  if (el) navigator.clipboard?.writeText(el.textContent)
+    .then(() => showToast('CODE COPIED'));
+}
 
-  let twTimer=null;
-  function typewrite(text){
-    if(twTimer) clearInterval(twTimer);
-    rTxt.className='resp-txt blink'; rTxt.textContent='';
-    let i=0;
-    twTimer=setInterval(()=>{
-      if(i<text.length){
-        rTxt.textContent+=text[i++];
-      } else {
-        rTxt.className='resp-txt';
-        clearInterval(twTimer); twTimer=null;
-        setTimeout(()=>setState('idle'),2200);
-      }
-    },14);
+// ── State machine ─────────────────────────────────────────────────────────
+let appState = 'idle';
+function setState(s) {
+  appState = s;
+  arcWrap.className = 'arc-wrap' + (s==='listening' ? ' lst' : s==='thinking' ? ' thk' : '');
+  waveEl.className  = 'wave' + (s==='listening' ? ' on' : '');
+  tDots.className   = 'tdots' + (s==='thinking' ? ' on' : '');
+  if (s === 'idle') {
+    micLbl.textContent = 'TAP TO SPEAK'; micLbl.className = 'mic-lbl';
+    led.className = 'led'; sysLbl.textContent = 'ONLINE'; sysLbl.className = 'sys-lbl';
+  } else if (s === 'listening') {
+    micLbl.textContent = 'LISTENING...'; micLbl.className = 'mic-lbl red';
+    led.className = 'led red'; sysLbl.textContent = 'LISTENING'; sysLbl.className = 'sys-lbl red';
+  } else if (s === 'thinking') {
+    micLbl.textContent = 'PROCESSING...'; micLbl.className = 'mic-lbl blue';
+    led.className = 'led blue'; sysLbl.textContent = 'THINKING'; sysLbl.className = 'sys-lbl blue';
+  } else if (s === 'speaking') {
+    micLbl.textContent = 'RESPONDING...'; micLbl.className = 'mic-lbl green';
+    led.className = 'led'; sysLbl.textContent = 'ONLINE'; sysLbl.className = 'sys-lbl';
   }
+}
 
-  let toastTimer=null;
-  function showToast(msg){
-    toastEl.textContent=msg;
-    toastEl.classList.add('on');
-    if(toastTimer) clearTimeout(toastTimer);
-    toastTimer=setTimeout(()=>toastEl.classList.remove('on'),3000);
-  }
-
-  async function runCmd(text){
-    if(!text||appState==='thinking') return;
-    synth.cancel();
-    setState('thinking');
-    qLine.textContent=text; qLine.className='query-line on';
-    rTxt.textContent=''; rTxt.className='resp-txt';
-    try{
-      const res  = await fetch('/command',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({command:text})
-      });
-      const data = await res.json();
-      const reply= data.reply||'No response received.';
-      setState('speaking');
-      typewrite(reply);
-      speak(reply);
-      if(data.action==='open_url'&&data.url){
-        const lbl=data.url_label||'LINK';
-        setTimeout(()=>{ showToast('>> OPENING '+lbl); window.open(data.url,'_blank'); },950);
-      }
-    } catch(e){
-      setState('idle');
-      typewrite('Neural link disrupted. Check connection, sir.');
-    }
-  }
-
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  let rec=null, micActive=false;
-  if(!SR){
-    document.getElementById('noVoice').classList.add('on');
-  } else {
-    rec=new SR();
-    rec.lang='en-IN';
-    rec.interimResults=false;
-    rec.maxAlternatives=1;
-    rec.continuous=false;
-    rec.onresult=(e)=>{ micActive=false; runCmd(e.results[0][0].transcript); };
-    rec.onerror=(e)=>{
-      micActive=false; setState('idle');
-      if(e.error==='no-speech') showToast('NO SPEECH DETECTED');
-      else if(e.error==='not-allowed') showToast('MIC ACCESS DENIED');
-      else showToast('MIC ERROR: '+e.error.toUpperCase());
-    };
-    rec.onend=()=>{ if(micActive){ micActive=false; setState('idle'); } };
-  }
-
-  function toggleMic(){
-    if(!rec) return;
-    if(micActive){ rec.stop(); micActive=false; setState('idle'); }
+// ── Typewriter / response renderer ────────────────────────────────────────
+let twTimer = null;
+function typewrite(text) {
+  if (twTimer) clearInterval(twTimer);
+  rTxt.className = 'resp-txt blink'; rTxt.textContent = '';
+  let i = 0;
+  twTimer = setInterval(() => {
+    if (i < text.length) { rTxt.textContent += text[i++]; }
     else {
-      if(appState==='thinking') return;
-      synth.cancel();
-      try{ rec.start(); micActive=true; setState('listening'); }
-      catch(e){ micActive=false; setState('idle'); showToast('MIC UNAVAILABLE'); }
+      rTxt.className = 'resp-txt';
+      clearInterval(twTimer); twTimer = null;
+      setTimeout(() => setState('idle'), 2500);
+    }
+  }, 12);
+}
+
+function showResponse(text) {
+  if (twTimer) { clearInterval(twTimer); twTimer = null; }
+  lastReply = text;
+  const hasCode = text.includes('```');
+  if (hasCode) {
+    rTxt.innerHTML = renderMarkdown(text);
+    rTxt.className = 'resp-txt';
+    setTimeout(() => setState('idle'), 4000);
+  } else {
+    typewrite(text);
+  }
+}
+
+// ── Offline canned responses ──────────────────────────────────────────────
+const JOKES = [
+  "Why do programmers prefer dark mode? Because light attracts bugs, sir.",
+  "I would tell you a joke about the cloud, but I'm afraid it's currently offline.",
+  "Why did the developer go broke? Because he used up all his cache.",
+  "What do you call a fish without eyes? An FSH. I'll see myself out.",
+];
+function offlineReply(text) {
+  const t = text.toLowerCase();
+  if (/\btime\b/.test(t)) return `It's ${new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true})} local time.`;
+  if (/\bdate\b|\btoday\b/.test(t)) return `Today is ${new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}.`;
+  if (/joke/.test(t)) return JOKES[Math.floor(Math.random()*JOKES.length)];
+  if (/motivat/.test(t)) return "Keep going, sir. Every master was once a beginner.";
+  if (/hello|hi\b|hey/.test(t)) return "Hello, sir. I'm running in offline mode at the moment.";
+  return "I'm currently offline, sir. Cloud systems are unreachable. Try your local PC address in settings, or check your connection.";
+}
+
+// ── Command runner ────────────────────────────────────────────────────────
+// Local voice shortcuts handled before server call
+const LOCAL_ACTIONS = {
+  'torch on':        () => toggleTorch(),
+  'turn on torch':   () => toggleTorch(),
+  'flashlight on':   () => toggleTorch(),
+  'torch off':       () => toggleTorch(),
+  'turn off torch':  () => toggleTorch(),
+  'flashlight off':  () => toggleTorch(),
+  'vibrate':         () => doVibrate(),
+  'buzz':            () => doVibrate(),
+  'copy that':       () => copyLast(),
+  'copy':            () => copyLast(),
+  'share that':      () => shareLast(),
+  'keep screen on':  () => toggleWakeLock(),
+  'controls':        () => openDrawer(),
+  'open controls':   () => openDrawer(),
+};
+
+async function runCmd(text) {
+  if (!text.trim() || appState === 'thinking') return;
+  synth.cancel();
+
+  // Local commands
+  const lower = text.toLowerCase().trim();
+  for (const [kw, fn] of Object.entries(LOCAL_ACTIONS)) {
+    if (lower.includes(kw)) {
+      fn();
+      return;
+    }
+  }
+  // Battery local
+  if (/battery/.test(lower)) { await showBattery(); return; }
+
+  setState('thinking');
+  qLine.textContent  = text; qLine.className = 'query-line on';
+  rTxt.textContent   = ''; rTxt.className = 'resp-txt';
+
+  let data = null;
+
+  // 1. Try cloud server
+  if (navigator.onLine) {
+    try {
+      const res = await fetch('/command', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({command: text}),
+        signal: AbortSignal.timeout(45000),
+      });
+      data = await res.json();
+    } catch(e) { console.log('[CLOUD] failed:', e.message); }
+  }
+
+  // 2. Try local PC (jarvis_web.py with Ollama)
+  if (!data) {
+    const pc = getLocalPC();
+    if (pc) {
+      try {
+        const url = pc.startsWith('http') ? pc : `http://${pc}`;
+        const res = await fetch(`${url}/command`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({command: text}),
+          signal: AbortSignal.timeout(60000),
+        });
+        data = await res.json();
+        data._local = true;
+      } catch(e) { console.log('[LOCAL PC] failed:', e.message); }
     }
   }
 
-  (async()=>{
-    try{
-      const res  = await fetch('/greet');
-      const data = await res.json();
-      setState('speaking');
-      typewrite(data.greeting);
-      speak(data.greeting);
-    } catch(e){
-      typewrite('J.A.R.V.I.S. online. Tap the reactor to speak.');
-      setState('idle');
-    }
-  })();
+  // 3. Offline fallback
+  if (!data) {
+    setState('speaking');
+    const rep = offlineReply(text);
+    showResponse(rep); speak(rep);
+    return;
+  }
+
+  setState('speaking');
+  const reply = data.reply || 'No response received.';
+  showResponse(reply);
+  speak(reply);
+
+  if (data.action === 'open_url' && data.url) {
+    setTimeout(() => {
+      showToast('>> OPENING ' + (data.url_label || 'LINK'));
+      window.open(data.url, '_blank');
+    }, 1000);
+  }
+}
+
+// ── Voice recognition ─────────────────────────────────────────────────────
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, micActive = false;
+if (!SR) {
+  document.getElementById('noVoice').classList.add('on');
+} else {
+  rec = new SR();
+  rec.lang = 'en-IN';
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  rec.continuous = false;
+  rec.onresult = e => { micActive = false; runCmd(e.results[0][0].transcript); };
+  rec.onerror  = e => {
+    micActive = false; setState('idle');
+    const errs = {
+      'no-speech':   'NO SPEECH DETECTED',
+      'not-allowed': 'MIC ACCESS DENIED',
+      'network':     'NETWORK ERROR',
+    };
+    showToast(errs[e.error] || 'MIC ERROR: ' + e.error.toUpperCase());
+  };
+  rec.onend = () => { if (micActive) { micActive = false; setState('idle'); } };
+}
+
+function toggleMic() {
+  if (!rec) return;
+  if (micActive) { rec.stop(); micActive = false; setState('idle'); }
+  else {
+    if (appState === 'thinking') return;
+    synth.cancel();
+    try { rec.start(); micActive = true; setState('listening'); }
+    catch(e) { micActive = false; setState('idle'); showToast('MIC UNAVAILABLE'); }
+  }
+}
+
+// ── Text input ────────────────────────────────────────────────────────────
+const txtIn = document.getElementById('txtIn');
+function sendTyped() {
+  const t = txtIn.value.trim();
+  if (!t) return;
+  txtIn.value = '';
+  runCmd(t);
+}
+txtIn.addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
+
+// ── Voice picker ──────────────────────────────────────────────────────────
+function openVoicePicker() {
+  if (voices.length === 0) loadVoices();
+  const list = document.getElementById('vList');
+  list.innerHTML = '';
+  const eng = voices.filter(v => /^en/i.test(v.lang));
+  if (eng.length === 0) {
+    list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:.85rem;">No voices loaded yet. Wait a moment.</p>';
+  } else {
+    eng.forEach(v => {
+      const isSel = selVoice && selVoice.voiceURI === v.voiceURI;
+      const item  = document.createElement('div');
+      item.className = 'vitem' + (isSel ? ' sel' : '');
+      item.innerHTML = `<span class="vn">${v.name}<span class="sel-mark"> ✓</span></span><div class="vl">${v.lang}${v.localService ? ' · LOCAL' : ' · NETWORK'}</div>`;
+      item.onclick = () => {
+        selVoice = v; selVoice._auto = false;
+        localStorage.setItem('jarvisVoiceURI', v.voiceURI);
+        closeVoicePicker();
+        synth.cancel();
+        const u = new SpeechSynthesisUtterance('Voice confirmed. I am J.A.R.V.I.S., at your service.');
+        u.voice = v; u.rate = 0.92; u.pitch = 0.82; u.volume = 1;
+        synth.speak(u);
+        showToast('VOICE SET: ' + v.name.toUpperCase());
+      };
+      list.appendChild(item);
+    });
+  }
+  document.getElementById('vModal').classList.add('on');
+}
+function closeVoicePicker() { document.getElementById('vModal').classList.remove('on'); }
+document.getElementById('vModal').addEventListener('click', function(e) { if (e.target === this) closeVoicePicker(); });
+
+// ── PWA Install ───────────────────────────────────────────────────────────
+let deferredPrompt = null;
+const installBar = document.getElementById('installBar');
+
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault(); deferredPrompt = e;
+  const dismissed = localStorage.getItem('installDismissed');
+  if (!dismissed) installBar.classList.add('on');
+});
+async function installApp() {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  const { outcome } = await deferredPrompt.userChoice;
+  deferredPrompt = null;
+  installBar.classList.remove('on');
+  if (outcome === 'accepted') showToast('JARVIS INSTALLED ✓');
+}
+function dismissInstall() {
+  installBar.classList.remove('on');
+  localStorage.setItem('installDismissed', '1');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+(async () => {
+  // Load voices (async on some browsers)
+  if (voices.length === 0) {
+    await new Promise(res => {
+      if (synth.getVoices().length > 0) { loadVoices(); res(); }
+      else { const h = () => { loadVoices(); synth.onvoiceschanged = null; res(); }; synth.onvoiceschanged = h; setTimeout(res, 2000); }
+    });
+  }
+
+  try {
+    const res  = await fetch('/greet');
+    const data = await res.json();
+    setState('speaking');
+    showResponse(data.greeting);
+    speak(data.greeting);
+  } catch(e) {
+    showResponse('J.A.R.V.I.S. online. Tap the reactor or type a command.');
+    setState('idle');
+  }
+})();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # FLASK APP
-# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 
@@ -920,17 +1483,12 @@ def index():
 
 @app.route("/greet")
 def greet():
-    hour = datetime.datetime.now(IST).hour
-    if 5 <= hour < 12:
-        msg = "Good morning, sir. Systems are fully operational and online."
-    elif 12 <= hour < 17:
-        msg = "Good afternoon. All systems nominal."
-    elif 17 <= hour < 21:
-        msg = "Good evening. Ready when you are."
-    elif 21 <= hour < 24:
-        msg = "Good night, sir. Working late again, I see."
-    else:
-        msg = "It is past midnight. May I ask why you are still awake?"
+    h = datetime.datetime.now(IST).hour
+    if   5  <= h < 12: msg = "Good morning, sir. Systems are fully operational. How may I assist you today?"
+    elif 12 <= h < 17: msg = "Good afternoon. All systems nominal. What can I do for you?"
+    elif 17 <= h < 21: msg = "Good evening. Ready when you are, sir."
+    elif 21 <= h < 24: msg = "Good night, sir. Working late again, I see. I'm at your service."
+    else:               msg = "It is past midnight. Still at it, sir? I'm here whenever you need me."
     return jsonify({"greeting": msg})
 
 @app.route("/command", methods=["POST"])
@@ -945,36 +1503,68 @@ def command():
 @app.route("/status")
 def status():
     return jsonify({
-        "status":  "online",
-        "model":   GROQ_MODEL,
-        "memory":  MEMORY_AVAILABLE,
-        "docs":    memory_collection.count() if MEMORY_AVAILABLE else 0,
-        "groq_ok": bool(groq_client),
+        "status":      "online",
+        "ai_primary":  GEMINI_MODEL if GEMINI_API_KEY else "not configured",
+        "ai_fallback": GROQ_MODEL   if (_groq_client) else "not configured",
+        "memory":      MEM_OK,
+        "docs":        _mem_col.count() if MEM_OK else 0,
+        "version":     "v2.0",
     })
 
-# PWA manifest (lets phone add JARVIS to home screen like an app)
+@app.route("/sw.js")
+def service_worker():
+    return Response(SERVICE_WORKER, mimetype="application/javascript",
+                    headers={"Service-Worker-Allowed": "/"})
+
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
         "name":             "J.A.R.V.I.S.",
         "short_name":       "JARVIS",
+        "description":      "Your personal AI — Gemini-powered, always ready",
         "start_url":        "/",
         "display":          "standalone",
-        "background_color": "#05080f",
-        "theme_color":      "#00bfff",
-        "description":      "Your personal AI assistant — 24/7 cloud edition",
-        "icons": [{"src": "/favicon.ico", "sizes": "any", "type": "image/x-icon"}]
+        "orientation":      "portrait",
+        "background_color": "#000814",
+        "theme_color":      "#00d4ff",
+        "icons": [
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+        ],
     })
 
+@app.route("/icon.svg")
+def icon():
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+        '<rect width="100" height="100" fill="#000814"/>'
+        '<circle cx="50" cy="50" r="42" fill="none" stroke="#00d4ff" stroke-width="2"/>'
+        '<circle cx="50" cy="50" r="30" fill="none" stroke="#00d4ff" stroke-width="1" opacity=".5"/>'
+        '<circle cx="50" cy="50" r="11" fill="#00d4ff" filter="url(#g)"/>'
+        '<defs><filter id="g"><feGaussianBlur stdDeviation="3"/></filter></defs>'
+        '<circle cx="50" cy="50" r="11" fill="#00d4ff"/>'
+        '</svg>'
+    )
+    return Response(svg, mimetype="image/svg+xml")
+
+# ══════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    print("+----------------------------------------------------+")
-    print("|  J.A.R.V.I.S. Cloud Edition                       |")
-    print("+----------------------------------------------------+")
-    if not GROQ_API_KEY:
-        print("|  WARNING: GROQ_API_KEY not set!                   |")
-        print("|  Get free key: https://console.groq.com           |")
-    else:
-        print("|  Groq API     : Connected                         |")
-    print(f"|  Running on   : http://0.0.0.0:{PORT}               |")
-    print("+----------------------------------------------------+")
+    print("+--------------------------------------------------+")
+    print("|  J.A.R.V.I.S. v2 - Cloud Edition                |")
+    print("+--------------------------------------------------+")
+    print(f"|  Gemini API : {'OK' if GEMINI_API_KEY else 'NOT SET -- add GEMINI_API_KEY'}")
+    print(f"|  Groq API   : {'OK (fallback)' if GROQ_API_KEY else 'NOT SET -- add GROQ_API_KEY'}")
+    print(f"|  News API   : {'OK' if NEWSAPI_KEY else 'Optional (NEWSAPI_KEY)'}")
+    print(f"|  Running on : http://0.0.0.0:{PORT}")
+    print("+--------------------------------------------------+")
+
+    if not GEMINI_API_KEY and not GROQ_API_KEY:
+        print()
+        print("WARNING: No AI keys set. Set GEMINI_API_KEY or GROQ_API_KEY.")
+        print("  Gemini key (free): https://aistudio.google.com/apikey")
+        print("  Groq key   (free): https://console.groq.com")
+        print()
+
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
