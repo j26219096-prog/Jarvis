@@ -1286,12 +1286,19 @@ async function runCmd(text) {
   qLine.textContent = text; qLine.className = 'query-line on';
   rTxt.textContent = ''; rTxt.className = 'resp-txt';
   actionBtn.className = 'action-btn';
+
+  // AbortController for 35s timeout (Render free can be slow on cold start)
+  const controller = new AbortController();
+  const timeoutId  = setTimeout(() => controller.abort(), 35000);
+
   try {
     const res  = await fetch('/command', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({command: text})
+      body: JSON.stringify({command: text}),
+      signal: controller.signal
     });
+    clearTimeout(timeoutId);
     const data = await res.json();
     const reply = data.reply || 'No response received.';
     setState('speaking');
@@ -1300,7 +1307,6 @@ async function runCmd(text) {
     // Handle special actions
     if (data.action) {
       const handled = handleSpecialAction(data);
-      // If action was an open_url we still show an action button
       if (data.action === 'open_url' && data.url) {
         actionBtn.textContent = '>> OPEN ' + (data.url_label || 'LINK');
         actionBtn.className = 'action-btn on';
@@ -1308,10 +1314,17 @@ async function runCmd(text) {
       }
     }
   } catch(e) {
+    clearTimeout(timeoutId);
     setState('idle');
-    const msg = navigator.onLine
-      ? 'Neural link disrupted. Check connection, sir.'
-      : 'Offline mode — limited functionality available.';
+    let msg;
+    if (e.name === 'AbortError') {
+      msg = 'Server is waking up (Render free tier). Please tap the reactor and try again in a few seconds, sir.';
+      showToast('COLD START — retrying...', 'red');
+    } else if (!navigator.onLine) {
+      msg = 'Offline mode — limited functionality available.';
+    } else {
+      msg = 'Neural link disrupted. The server may be starting up — please try again in 15 seconds, sir.';
+    }
     typewrite(msg);
   }
 }
@@ -1420,6 +1433,12 @@ if (firstVisit && synth) {
   };
   setTimeout(showPickerWhenReady, 800);
 }
+
+/* ── Pre-warm server ping (prevents cold-start failures) ── */
+(async () => {
+  try { await fetch('/ping', {signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : new AbortController().signal}); }
+  catch(e) { /* silent — just warming up */ }
+})();
 
 /* ── Greeting on load ── */
 (async () => {
@@ -1987,11 +2006,25 @@ def pc_command_relay():
 def status():
     return jsonify({
         "status":  "online",
-        "version": "3.0",
+        "version": "4.0",
         "model":   GROQ_MODEL,
         "memory":  MEMORY_AVAILABLE,
         "docs":    memory_collection.count() if MEMORY_AVAILABLE else 0,
         "groq_ok": bool(groq_client),
+    })
+
+@app.route("/ping")
+def ping():
+    """Lightweight keepalive endpoint — call this to wake Render from sleep."""
+    return jsonify({"pong": True, "time": datetime.datetime.now(IST).isoformat()})
+
+@app.route("/health")
+def health():
+    """Health check for monitoring."""
+    return jsonify({
+        "ok":      True,
+        "groq":    bool(groq_client),
+        "memory":  MEMORY_AVAILABLE,
     })
 
 @app.route("/sw.js")

@@ -3,12 +3,11 @@ services:
     name: jarvis-ai-v2
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn jarvis_cloud:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    startCommand: gunicorn jarvis_cloud:app --bind 0.0.0.0:$PORT --workers 2 --timeout 180 --keep-alive 5 --log-level info
     envVars:
-      - key: GEMINI_API_KEY
-        sync: false        # Paste from https://aistudio.google.com/apikey (free)
       - key: GROQ_API_KEY
-        sync: false        # Paste from https://console.groq.com (free, fallback)
+        sync: false        # Paste from https://console.groq.com (free, fast)
       - key: NEWSAPI_KEY
         sync: false        # Optional — for world news (https://newsapi.org)
     plan: free
+    healthCheckPath: /ping
