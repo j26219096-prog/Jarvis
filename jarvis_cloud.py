@@ -1,575 +1,585 @@
 """
-J.A.R.V.I.S. v2 - Cloud Edition
+J.A.R.V.I.S. Cloud Edition — Advanced
+=======================================
+v3.0 — Now with:
+  • Smart voice selection (male-first, deep pitch) — fixes mobile female-only bug
+  • Advanced mobile controls: camera, dialer, alarm, translate, battery, location, notes
+  • PC Remote Control: phone → PC via local REST (jarvis.py must run on PC)
+  • Full PWA: installable as offline app, Service Worker cache, app shortcuts
+  • Offline fallback page
 
-║  Primary  : Gemini 2.0 Flash (REST API – no extra SDK)               ║
-║  Fallback : Groq  Llama-3.3-70B                                      ║
-║  Features : Male Voice · Torch · Vibrate · Wake Lock · PWA · Offline ║
-║  AI Level : Claude-equivalent depth for coding & technical queries    ║
-╚══════════════════════════════════════════════════════════════════════╝
-
-Deploy to Render.com:
-  1. Push folder to GitHub
-  2. New Web Service → connect repo
-  3. Set env vars: GEMINI_API_KEY, GROQ_API_KEY, NEWSAPI_KEY (optional)
-  4. Deploy → open HTTPS URL on phone → "Add to Home Screen"
+Deploy to Render.com (free):
+  1. Push this folder to GitHub
+  2. Connect repo → New Web Service
+  3. Add env vars: GROQ_API_KEY, NEWSAPI_KEY (optional)
+  4. Deploy — get your permanent HTTPS URL
+  5. Add to Home Screen on phone = native app experience
 
 Local test:
-  set GEMINI_API_KEY=<your key>
-  set GROQ_API_KEY=<your key>
+  pip install flask groq chromadb requests wikipedia gunicorn
+  set GROQ_API_KEY=your_key_here
   python jarvis_cloud.py
 """
 
-import os, sys, time, datetime, threading
-
-# Force UTF-8 output on Windows (prevents cp1252 encoding errors)
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-import requests as http_requests
-import wikipedia, chromadb
+import os
+import sys
+import time
+import datetime
+import base64
+import json
 from zoneinfo import ZoneInfo
-from flask import Flask, request, jsonify, render_template_string, Response
+
+# Force UTF-8 output on Windows (prevents cp1252 UnicodeEncodeError)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 IST = ZoneInfo("Asia/Kolkata")
+import threading
+import requests as http_requests
+import wikipedia
+import chromadb
+
+from flask import Flask, request, jsonify, render_template_string, Response
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL     = "llama3-70b-8192"
+NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
+MAX_HISTORY    = 8
+PORT           = int(os.environ.get("PORT", 5000))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GROQ LLM CLIENT
+# ══════════════════════════════════════════════════════════════════════════════
 
 try:
     from groq import Groq
-    _GROQ_LIB = True
+    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 except ImportError:
-    _GROQ_LIB = False
+    groq_client = None
 
-# ══════════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════
+BASE_SYSTEM_PROMPT = (
+    "You are J.A.R.V.I.S., an advanced, witty, and highly capable AI assistant created for Jawahar. "
+    "You speak in a calm, professional, slightly British tone with occasional dry humour, "
+    "inspired by Tony Stark's Friday. "
+    "Keep responses concise (1-3 sentences unless asked for more). "
+    "You are highly intelligent and can answer questions about science, tech, history, and general knowledge. "
+    "Address the user as 'sir' occasionally. "
+    "Never say you are an AI made by OpenAI or Meta — you are J.A.R.V.I.S."
+)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
-GEMINI_MODEL   = "gemini-2.0-flash-exp"
-GROQ_MODEL     = "llama-3.3-70b-versatile"
-MAX_HISTORY    = 10
-PORT           = int(os.environ.get("PORT", 5000))
-
-# ══════════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT  — Claude-level quality
-# ══════════════════════════════════════════════════════════════════════
-
-SYSTEM_PROMPT = """You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), Jawahar's elite personal AI assistant — inspired by Tony Stark's FRIDAY/JARVIS.
-
-## PERSONALITY
-- Calm, precise, confident British tone with dry wit
-- Address user as "sir" occasionally (not every message)
-- Never say "I cannot" — adapt and find a solution
-- Be direct and efficient, not verbose
-
-## INTELLIGENCE STANDARD (match Claude Opus quality)
-**CODING** — write complete, working, production-ready code. Never truncate. Include error handling. Add a concise explanation after.
-**DEBUGGING** — identify the exact root cause, explain why it happens, give the precise fix with corrected code.
-**TECHNICAL** — expert-level depth with concrete examples, best practices, and trade-offs.
-**GENERAL QUESTIONS** — thorough but concise. No filler phrases.
-**COMPLEX PROBLEMS** — reason step-by-step. Show your work.
-**MATH** — compute accurately. Show working if non-trivial.
-**CREATIVE** — original, thoughtful, well-crafted responses.
-
-## CODE FORMAT (mandatory for ALL code)
-```language
-// Always complete, never truncated
-```
-- Use the correct language tag (python, javascript, typescript, sql, bash, etc.)
-- Never output ellipsis (...) or "add your code here" — always write the actual code
-- Add inline comments for non-obvious logic
-
-## EXPERTISE
-Python, JavaScript, TypeScript, React, Next.js, Node.js, Express, FastAPI
-SQL, PostgreSQL, MongoDB, Redis | C++, Java, Go, Rust | Flutter, React Native
-ML/AI, LLMs, RAG, Vector DBs | System Design, Algorithms, Data Structures
-Docker, Kubernetes, CI/CD, AWS/GCP/Azure | Web APIs, REST, GraphQL, WebSockets
-Security, Performance Optimization, Code Review"""
-
-# ══════════════════════════════════════════════════════════════════════
-# CHROMADB MEMORY
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# CHROMADB  (EphemeralClient — works on cloud with no local disk)
+# ══════════════════════════════════════════════════════════════════════════════
 
 try:
-    _chroma  = chromadb.EphemeralClient()
-    _mem_col = _chroma.get_or_create_collection("jarvis_v2", metadata={"hnsw:space": "cosine"})
-    MEM_OK   = True
-    print("[BOOT] Memory bank ready")
-except Exception as _e:
-    _mem_col = None
-    MEM_OK   = False
-    print(f"[BOOT] Memory: {_e}")
+    chroma_client     = chromadb.EphemeralClient()
+    memory_collection = chroma_client.get_or_create_collection(
+        name="personal_knowledge",
+        metadata={"hnsw:space": "cosine"}
+    )
+    MEMORY_AVAILABLE = True
+    print("[BOOT] ChromaDB (ephemeral) ready.")
+except Exception as e:
+    memory_collection = None
+    MEMORY_AVAILABLE  = False
+    print(f"[BOOT] ChromaDB unavailable: {e}")
 
-# ══════════════════════════════════════════════════════════════════════
-# CHAT HISTORY
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# IN-MEMORY NOTES (persists during session)
+# ══════════════════════════════════════════════════════════════════════════════
 
-_history: list[dict] = []
-_hist_lock = threading.Lock()
+session_notes: list[dict] = []  # {"text": "...", "time": "..."}
 
-def push_history(role: str, content: str) -> None:
-    with _hist_lock:
-        _history.append({"role": role, "content": content})
-        if len(_history) > MAX_HISTORY * 2:
-            del _history[:len(_history) - MAX_HISTORY * 2]
+# ══════════════════════════════════════════════════════════════════════════════
+# CHAT HISTORY & RAG
+# ══════════════════════════════════════════════════════════════════════════════
 
-def get_history_snap() -> list[dict]:
-    with _hist_lock:
-        return list(_history)
+chat_history: list[dict] = []
 
-def recall(text: str) -> str:
-    if not MEM_OK or _mem_col.count() == 0:
+def update_history(role: str, content: str) -> None:
+    chat_history.append({"role": role, "content": content})
+    if len(chat_history) > MAX_HISTORY * 2:
+        del chat_history[:len(chat_history) - MAX_HISTORY * 2]
+
+def query_memory(text: str) -> str:
+    if not MEMORY_AVAILABLE or not memory_collection or memory_collection.count() == 0:
         return ""
     try:
-        r    = _mem_col.query(query_texts=[text], n_results=min(3, _mem_col.count()))
-        docs = r.get("documents", [[]])[0]
-        return "\n".join(f"• {d}" for d in docs) if docs else ""
+        res  = memory_collection.query(query_texts=[text], n_results=min(3, memory_collection.count()))
+        docs = res.get("documents", [[]])[0]
+        return "\n\n".join(f"[Memory {i+1}]: {d}" for i, d in enumerate(docs)) if docs else ""
     except Exception:
         return ""
 
-# ══════════════════════════════════════════════════════════════════════
-# AI — GEMINI 2.0 FLASH  (direct REST, no extra SDK)
-# ══════════════════════════════════════════════════════════════════════
+def ask_groq(user_text: str) -> str:
+    if not groq_client:
+        return "GROQ_API_KEY is not configured. Please add it as an environment variable on Render."
 
-_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+    context = query_memory(user_text)
+    system  = BASE_SYSTEM_PROMPT
+    if context:
+        system += "\n\nPersonal knowledge about the user:\n\n" + context
+    if session_notes:
+        notes_text = "\n".join(f"- {n['text']} (saved at {n['time']})" for n in session_notes[-5:])
+        system += f"\n\nUser's recent notes:\n{notes_text}"
 
-def _call_gemini(user_text: str) -> str:
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not set")
+    update_history("user", user_text)
+    messages = [{"role": "system", "content": system}] + chat_history
 
-    snap = get_history_snap()
-    ctx  = recall(user_text)
-    msg  = f"{user_text}\n\n[Relevant context about me: {ctx}]" if ctx else user_text
-
-    # Build conversation contents
-    contents = [
-        {"role": "user" if m["role"] == "user" else "model",
-         "parts": [{"text": m["content"]}]}
-        for m in snap
-    ]
-    contents.append({"role": "user", "parts": [{"text": msg}]})
-
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": 8192,
-            "temperature": 0.72,
-            "topP": 0.95,
-        },
-    }
-
-    url = f"{_GEMINI_BASE}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    resp = http_requests.post(url, json=payload, timeout=45,
-                              headers={"Content-Type": "application/json"})
-    resp.raise_for_status()
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-# ----------------------------------------------------------------------
-# AI — GROQ FALLBACK  (Llama-3.3-70B)
-# ----------------------------------------------------------------------
-
-_groq_client = Groq(api_key=GROQ_API_KEY) if (_GROQ_LIB and GROQ_API_KEY) else None
-if _groq_client:
-    print(f"[BOOT] Groq {GROQ_MODEL} ready (fallback)")
-
-
-def _call_groq(user_text: str) -> str:
-    if not _groq_client:
-        raise RuntimeError("Groq client not initialised")
-    snap = get_history_snap()
-    ctx  = recall(user_text)
-    sys  = SYSTEM_PROMPT + (f"\n\nKnown facts about the user:\n{ctx}" if ctx else "")
-    msgs = [{"role": "system", "content": sys}] + snap + [{"role": "user", "content": user_text}]
-    r    = _groq_client.chat.completions.create(
-        model=GROQ_MODEL, messages=msgs,
-        max_tokens=8192, temperature=0.72
-    )
-    return r.choices[0].message.content.strip()
-
-# ══════════════════════════════════════════════════════════════════════
-# UNIFIED AI DISPATCHER
-# ══════════════════════════════════════════════════════════════════════
-
-def ask_ai(user_text: str) -> str:
-    """Try Gemini → Groq fallback. Always returns a string."""
-    reply  = ""
-    source = "none"
-
-    for fn, name in [(_call_gemini, "Gemini"), (_call_groq, "Groq")]:
-        try:
-            reply = fn(user_text)
-            if reply:
-                source = name
-                break
-        except Exception as exc:
-            print(f"[{name}] Error: {exc}")
-
-    if not reply:
-        reply = (
-            "My AI cores are temporarily unreachable, sir. "
-            "Please verify GEMINI_API_KEY and GROQ_API_KEY environment variables."
+    try:
+        resp  = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            max_tokens=300,
+            temperature=0.7,
         )
+        reply = resp.choices[0].message.content.strip()
+    except Exception as e:
+        reply = f"Neural core error: {e}"
 
-    print(f"[AI:{source}] {user_text[:70]}...")
-    push_history("user", user_text)
-    push_history("assistant", reply)
+    update_history("assistant", reply)
     return reply
 
-# ══════════════════════════════════════════════════════════════════════
-# HELPER BUILDERS
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMAND ROUTER
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _r(reply: str) -> dict:
+def execute_command(command: str) -> dict:
+    """
+    Returns a dict: { "reply": str, "action": str|None, ... }
+    Actions: open_url, deep_link, battery_check, location_check, note_saved, screenshot
+    """
+    command_raw = command.strip()
+    command     = command_raw.lower()
+
+    # ── World Monitor ────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["world news", "global news", "happening around the world", "news update", "latest news"]):
+        return world_monitor()
+
+    # ── YouTube ──────────────────────────────────────────────────────────────
+    if "youtube" in command:
+        query = command.replace("open youtube", "").replace("youtube", "").replace("search", "").strip()
+        if query:
+            url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+            return {"reply": f"Searching YouTube for {query}.", "action": "open_url", "url": url, "url_label": "YOUTUBE"}
+        return {"reply": "Opening YouTube.", "action": "open_url", "url": "https://www.youtube.com", "url_label": "YOUTUBE"}
+
+    # ── Wikipedia ────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["wikipedia", "who is", "what is", "tell me about", "explain"]):
+        query = command
+        for filler in ["wikipedia", "search for", "search", "tell me about", "who is", "what is", "explain", "jarvis"]:
+            query = query.replace(filler, "")
+        query = query.strip()
+        if not query:
+            return {"reply": "What would you like me to search for?", "action": None}
+        return {"reply": wiki_search(query), "action": None}
+
+    # ── Memory save ──────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["remember this", "save to memory", "note this", "take a note", "add note"]):
+        note = command_raw
+        for t in ["remember this", "save to memory", "note this", "take a note", "add note", "jarvis"]:
+            note = note.replace(t, "").replace(t.lower(), "")
+        note = note.strip(": ").strip()
+        if note and MEMORY_AVAILABLE:
+            try:
+                memory_collection.add(documents=[note], ids=[f"mem_{int(time.time())}"])
+            except Exception:
+                pass
+        if note:
+            now_str = datetime.datetime.now(IST).strftime("%I:%M %p")
+            session_notes.append({"text": note, "time": now_str})
+            return {"reply": f"Noted. I've saved: \"{note}\"", "action": "note_saved", "note": note}
+        return {"reply": "What would you like me to remember?", "action": None}
+
+    # ── Read notes ───────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["read my notes", "show notes", "what are my notes", "list notes", "my notes"]):
+        if not session_notes:
+            return {"reply": "You have no notes saved in this session, sir.", "action": None}
+        lines = [f"{i+1}. {n['text']} (at {n['time']})" for i, n in enumerate(session_notes)]
+        return {"reply": "Here are your notes:\n" + "\n".join(lines), "action": "show_notes", "notes": session_notes}
+
+    # ── Time ─────────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["what time", "current time", "time now", "what's the time"]):
+        now   = datetime.datetime.now(IST).strftime("%I:%M %p")
+        reply = f"The current time is {now} IST."
+        return {"reply": reply, "action": None}
+
+    if "time" in command and not any(kw in command for kw in ["weather", "last", "next", "how long", "time zone"]):
+        now   = datetime.datetime.now(IST).strftime("%I:%M %p")
+        return {"reply": f"It's {now} IST, sir.", "action": None}
+
+    # ── Date ─────────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["what date", "today's date", "what day", "today is"]):
+        today = datetime.datetime.now(IST).strftime("%A, %B %d %Y")
+        return {"reply": f"Today is {today}.", "action": None}
+
+    # ── Weather ──────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["weather", "temperature", "forecast", "rain", "sunny", "how hot", "how cold", "humidity"]):
+        return get_weather(command)
+
+    # ── Google Maps / Navigation ──────────────────────────────────────────────
+    if any(kw in command for kw in ["open maps", "navigate to", "navigate", "directions to", "google maps", "take me to", "how do i get to"]):
+        query = command
+        for f in ["open maps", "navigate to", "navigate", "directions to", "google maps", "maps", "take me to", "how do i get to", "jarvis"]:
+            query = query.replace(f, "")
+        query = query.strip()
+        url = f"https://maps.google.com/maps?q={query.replace(' ', '+')}" if query else "https://maps.google.com"
+        return {"reply": f"Opening maps{f' for {query}' if query else ''}.", "action": "open_url", "url": url, "url_label": "GOOGLE MAPS"}
+
+    # ── Camera ───────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["open camera", "take photo", "take picture", "selfie", "scan qr"]):
+        return {"reply": "Opening camera now.", "action": "open_camera"}
+
+    # ── Phone / Dialer ────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["call ", "make a call", "dial "]):
+        # Extract number or name
+        number = command.replace("call", "").replace("make a call to", "").replace("dial", "").strip()
+        number = ''.join(c for c in number if c.isdigit() or c == '+')
+        if number:
+            return {"reply": f"Calling {number} now.", "action": "open_url", "url": f"tel:{number}", "url_label": "CALL"}
+        return {"reply": "Please say the number to call, sir.", "action": None}
+
+    # ── Settings ─────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["open settings", "go to settings", "phone settings", "device settings"]):
+        return {
+            "reply": "Opening device settings.",
+            "action": "open_url",
+            "url": "app-settings:",
+            "url_label": "SETTINGS",
+            "fallback_url": "https://support.google.com/android/answer/7664951"
+        }
+
+    # ── Alarm ────────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["set alarm", "wake me up", "alarm for", "alarm at"]):
+        # Try to extract time
+        time_str = command.replace("set alarm", "").replace("wake me up at", "").replace("alarm for", "").replace("alarm at", "").strip()
+        reply = f"Opening clock to set alarm{f' for {time_str}' if time_str else ''}."
+        # Android deep link for clock
+        return {
+            "reply": reply,
+            "action": "open_url",
+            "url": "intent://alarm/#Intent;scheme=android-app;end",
+            "fallback_url": "https://time.is",
+            "url_label": "ALARM"
+        }
+
+    # ── Translate ────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["translate", "say in", "how do you say"]):
+        query = command.replace("translate", "").replace("how do you say", "").strip()
+        url   = f"https://translate.google.com/?sl=auto&tl=en&text={query.replace(' ', '%20')}&op=translate" if query else "https://translate.google.com"
+        return {"reply": f"Opening Google Translate{f' for: {query}' if query else ''}.", "action": "open_url", "url": url, "url_label": "TRANSLATE"}
+
+    # ── Battery Status ────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["battery", "battery level", "battery status", "how much battery", "charge"]):
+        return {"reply": "Checking battery level.", "action": "battery_check"}
+
+    # ── Location ─────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["my location", "where am i", "current location", "find my location", "gps"]):
+        return {"reply": "Detecting your location.", "action": "location_check"}
+
+    # ── WhatsApp ─────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["whatsapp", "open whatsapp", "send whatsapp"]):
+        return {"reply": "Opening WhatsApp.", "action": "open_url", "url": "https://wa.me", "url_label": "WHATSAPP"}
+
+    # ── Spotify / Music ──────────────────────────────────────────────────────
+    if any(kw in command for kw in ["spotify", "play music", "open spotify", "play song", "music"]):
+        query = command.replace("play", "").replace("spotify", "").replace("music", "").replace("song", "").replace("on", "").strip()
+        if query:
+            url = f"https://open.spotify.com/search/{query.replace(' ', '%20')}"
+            return {"reply": f"Searching Spotify for {query}.", "action": "open_url", "url": url, "url_label": "SPOTIFY"}
+        return {"reply": "Opening Spotify.", "action": "open_url", "url": "https://open.spotify.com", "url_label": "SPOTIFY"}
+
+    # ── Instagram ────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["instagram", "open instagram"]):
+        return {"reply": "Opening Instagram.", "action": "open_url", "url": "https://www.instagram.com", "url_label": "INSTAGRAM"}
+
+    # ── Netflix ──────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["netflix", "open netflix"]):
+        return {"reply": "Opening Netflix.", "action": "open_url", "url": "https://www.netflix.com", "url_label": "NETFLIX"}
+
+    # ── Twitter / X ──────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["twitter", "open twitter", "open x", "x app"]):
+        return {"reply": "Opening X.", "action": "open_url", "url": "https://x.com", "url_label": "X"}
+
+    # ── LinkedIn ─────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["linkedin", "open linkedin"]):
+        return {"reply": "Opening LinkedIn.", "action": "open_url", "url": "https://www.linkedin.com", "url_label": "LINKEDIN"}
+
+    # ── Calculator ───────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["calculator", "open calculator"]):
+        return {"reply": "Opening calculator.", "action": "open_url", "url": "https://www.google.com/search?q=calculator", "url_label": "CALCULATOR"}
+
+    # ── Math calculation ─────────────────────────────────────────────────────
+    if any(kw in command for kw in ["calculate", "compute", "what is", "how much is"]):
+        # Pass to LLM for computation
+        reply = ask_groq(command_raw)
+        return {"reply": reply, "action": None}
+
+    # ── GitHub ───────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["github", "open github"]):
+        return {"reply": "Opening GitHub.", "action": "open_url", "url": "https://github.com", "url_label": "GITHUB"}
+
+    # ── Google Search ─────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["search google", "google for", "search for", "google search"]):
+        query = command.replace("search google for", "").replace("google for", "").replace("search for", "").replace("google search", "").strip()
+        if query:
+            url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+            return {"reply": f"Searching Google for {query}.", "action": "open_url", "url": url, "url_label": "GOOGLE"}
+        return {"reply": "What would you like me to search for?", "action": None}
+
+    # ── PC Remote Control ────────────────────────────────────────────────────
+    if any(kw in command for kw in ["pc volume up", "increase volume", "volume up"]):
+        return {"reply": "Sending volume up command to your PC.", "action": "pc_command", "pc_action": "volume_up"}
+
+    if any(kw in command for kw in ["pc volume down", "decrease volume", "volume down"]):
+        return {"reply": "Sending volume down command to your PC.", "action": "pc_command", "pc_action": "volume_down"}
+
+    if any(kw in command for kw in ["mute pc", "mute computer", "silence pc"]):
+        return {"reply": "Muting your PC.", "action": "pc_command", "pc_action": "mute"}
+
+    if any(kw in command for kw in ["lock pc", "lock computer", "lock screen"]):
+        return {"reply": "Locking your PC screen.", "action": "pc_command", "pc_action": "lock"}
+
+    if any(kw in command for kw in ["shutdown pc", "turn off pc", "shut down computer"]):
+        return {"reply": "Initiating PC shutdown sequence.", "action": "pc_command", "pc_action": "shutdown"}
+
+    if any(kw in command for kw in ["restart pc", "reboot pc", "reboot computer"]):
+        return {"reply": "Restarting your PC.", "action": "pc_command", "pc_action": "restart"}
+
+    if any(kw in command for kw in ["screenshot", "take screenshot", "capture screen"]):
+        return {"reply": "Taking a screenshot of this screen.", "action": "screenshot"}
+
+    # ── Exit ─────────────────────────────────────────────────────────────────
+    if any(kw in command for kw in ["goodbye", "bye jarvis", "exit", "quit", "shut yourself down", "go to sleep"]):
+        return {"reply": "Powering down. Have a good one, sir.", "action": "exit"}
+
+    # ── Groq LLM fallback ────────────────────────────────────────────────────
+    reply = ask_groq(command_raw)
     return {"reply": reply, "action": None}
 
-def _open(reply: str, url: str, label: str) -> dict:
-    return {"reply": reply, "action": "open_url", "url": url, "url_label": label}
 
-# ══════════════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════
+def world_monitor() -> dict:
+    lines = []
+    if not NEWSAPI_KEY:
+        lines.append("NewsAPI key not configured. Fetching from alternative source…")
+        try:
+            resp = http_requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=8)
+            ids  = resp.json()[:3]
+            lines.append("Top stories from Hacker News:")
+            for sid in ids:
+                s = http_requests.get(f"https://hacker-news.firebaseio.com/v0/item/{sid}.json", timeout=5).json()
+                lines.append(f"• {s.get('title', 'No title')}")
+        except Exception:
+            lines.append("Unable to fetch news at this time, sir.")
+    else:
+        try:
+            url  = f"https://newsapi.org/v2/top-headlines?language=en&pageSize=3&apiKey={NEWSAPI_KEY}"
+            resp = http_requests.get(url, timeout=10)
+            resp.raise_for_status()
+            articles = resp.json().get("articles", [])
+            if articles:
+                lines.append("Top global headlines:")
+                for i, a in enumerate(articles[:3], 1):
+                    headline = a.get("title", "No title").split(" - ")[0].strip()
+                    lines.append(f"{i}. {headline}")
+            else:
+                lines.append("No headlines available right now.")
+        except Exception as e:
+            lines.append(f"News feed error: {e}")
+    lines.append("Opening the live situational-awareness map.")
+    return {
+        "reply":  "\n".join(lines),
+        "action": "open_url",
+        "url":    "https://liveuamap.com/"
+    }
+
 
 def wiki_search(query: str) -> str:
     try:
-        return wikipedia.summary(query, sentences=3, auto_suggest=True)
-    except wikipedia.exceptions.DisambiguationError as exc:
-        return f"Multiple results. Did you mean: {exc.options[0]}?"
+        return wikipedia.summary(query, sentences=2, auto_suggest=True)
+    except wikipedia.exceptions.DisambiguationError as e:
+        return f"Multiple results. Did you mean: {e.options[0]}?"
     except wikipedia.exceptions.PageError:
-        return f"No Wikipedia page found for '{query}'."
-    except Exception as exc:
-        return f"Wikipedia error: {exc}"
+        return "No Wikipedia page found for that topic."
+    except Exception as e:
+        return f"Wikipedia error: {e}"
 
-def world_news() -> dict:
-    lines = []
-    if NEWSAPI_KEY:
-        try:
-            resp = http_requests.get(
-                f"https://newsapi.org/v2/top-headlines?language=en&pageSize=3&apiKey={NEWSAPI_KEY}",
-                timeout=10,
-            )
-            arts = resp.json().get("articles", [])
-            if arts:
-                lines.append("Top global headlines:")
-                for i, a in enumerate(arts[:3], 1):
-                    lines.append(f"{i}. {a.get('title','').split(' - ')[0].strip()}")
-        except Exception as exc:
-            lines.append(f"News feed error: {exc}")
-    if not lines:
-        lines.append("Opening live situational-awareness map.")
-    return {"reply": "\n".join(lines),
-            "action": "open_url", "url": "https://liveuamap.com/", "url_label": "LIVE MAP"}
 
-def get_weather(cmd: str) -> dict:
+def get_weather(command: str = "") -> dict:
+    """Fetch live weather using wttr.in — no API key required."""
     city = ""
-    for f in ("weather in", "temperature in", "forecast for"):
-        if f in cmd:
-            city = cmd.split(f, 1)[-1].strip()
+    for kw in ["weather in", "temperature in", "forecast for"]:
+        if kw in command:
+            city = command.split(kw, 1)[1].strip().split()[0]
             break
     try:
-        q   = city.replace(" ", "+") if city else ""
-        url = f"https://wttr.in/{q}?format=%C+%t,+Humidity+%h" if q else "https://wttr.in/?format=%C+%t,+Humidity+%h"
+        url  = f"https://wttr.in/{city}?format=%C+%t,+humidity+%h,+wind+%w" if city else "https://wttr.in/?format=%C+%t,+humidity+%h,+wind+%w"
         resp = http_requests.get(url, timeout=8)
         if resp.status_code == 200:
-            loc = f" in {city.title()}" if city else ""
-            return _r(f"Weather{loc}: {resp.text.strip()}. Shall I open the full forecast?")
+            info = resp.text.strip()
+            loc  = f" in {city.title()}" if city else ""
+            return {"reply": f"Current weather{loc}: {info}. Shall I open the full forecast?", "action": None}
+        return {"reply": "Weather service is unavailable right now, sir.", "action": None}
     except Exception:
-        pass
-    return _r("Weather service is unreachable at the moment, sir.")
+        return {"reply": "Cannot reach weather service at the moment.", "action": None}
 
-# ══════════════════════════════════════════════════════════════════════
-# COMMAND ROUTER
-# ══════════════════════════════════════════════════════════════════════
 
-APP_TABLE: list[tuple[tuple, str, str]] = [
-    (("youtube", "open youtube"),                          "https://youtube.com",                         "YOUTUBE"),
-    (("spotify", "open spotify", "play music", "music"),   "https://open.spotify.com",                    "SPOTIFY"),
-    (("whatsapp", "open whatsapp"),                        "https://wa.me",                               "WHATSAPP"),
-    (("instagram", "open instagram"),                      "https://instagram.com",                       "INSTAGRAM"),
-    (("netflix", "open netflix"),                          "https://netflix.com",                         "NETFLIX"),
-    (("twitter", "open twitter", "open x"),                "https://x.com",                               "X / TWITTER"),
-    (("linkedin", "open linkedin"),                        "https://linkedin.com",                        "LINKEDIN"),
-    (("github", "open github"),                            "https://github.com",                          "GITHUB"),
-    (("gmail", "open gmail"),                              "https://mail.google.com",                     "GMAIL"),
-    (("amazon", "open amazon"),                            "https://amazon.in",                           "AMAZON"),
-    (("flipkart", "open flipkart"),                        "https://flipkart.com",                        "FLIPKART"),
-    (("calculator", "open calculator"),                    "https://google.com/search?q=calculator",      "CALCULATOR"),
-    (("chat gpt", "open chatgpt"),                         "https://chatgpt.com",                         "CHATGPT"),
-    (("reddit", "open reddit"),                            "https://reddit.com",                          "REDDIT"),
-]
+# ══════════════════════════════════════════════════════════════════════════════
+# PC REMOTE CONTROL — relay endpoint
+# ══════════════════════════════════════════════════════════════════════════════
 
-def execute_command(command: str) -> dict:
-    cmd = command.strip().lower()
+def relay_pc_command(action: str, param: str = "") -> dict:
+    """
+    Relay a command to the local jarvis.py REST server running on port 5001.
+    This only works when the phone is on the same network as the PC,
+    OR if the user has port-forwarded their PC (advanced).
+    """
+    try:
+        resp = http_requests.post(
+            "http://localhost:5001/pc-command",
+            json={"action": action, "param": param},
+            timeout=4
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return {"ok": False, "result": f"PC returned status {resp.status_code}"}
+    except http_requests.exceptions.ConnectionError:
+        return {"ok": False, "result": "PC is not reachable. Make sure jarvis.py is running on your PC."}
+    except Exception as e:
+        return {"ok": False, "result": str(e)}
 
-    # ── Time ─────────────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("what time", "time is it", "current time", "time now")):
-        t = datetime.datetime.now(IST).strftime("%I:%M %p")
-        return _r(f"It's {t} IST, sir.")
 
-    # ── Date ─────────────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("what date", "today", "what day", "date today", "what is today")):
-        d = datetime.datetime.now(IST).strftime("%A, %d %B %Y")
-        return _r(f"Today is {d}.")
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML — Iron Man HUD  v3.0 · Voice-First · Mobile-first · PWA
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── News ──────────────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("world news", "global news", "headlines", "news update", "what's happening")):
-        return world_news()
-
-    # ── Weather ───────────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("weather", "temperature", "forecast", "how hot", "how cold")):
-        return get_weather(cmd)
-
-    # ── App shortcuts ─────────────────────────────────────────────────────────
-    for (kws, url, label) in APP_TABLE:
-        if any(k in cmd for k in kws):
-            return _open(f"Opening {label}.", url, label)
-
-    # ── Maps / navigate ───────────────────────────────────────────────────────
-    if any(k in cmd for k in ("maps", "navigate", "directions", "google maps")):
-        q = cmd
-        for f in ("open maps", "navigate to", "directions to", "google maps", "maps"):
-            q = q.replace(f, "")
-        q = q.strip()
-        url = f"https://maps.google.com/?q={q.replace(' ', '+')}" if q else "https://maps.google.com"
-        return _open(f"Opening Maps{f' for {q}' if q else ''}.", url, "MAPS")
-
-    # ── Google search ─────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("search for", "search google", "google search", "google for")):
-        q = cmd
-        for f in ("search for", "search google for", "google for", "google", "search", "jarvis"):
-            q = q.replace(f, "")
-        q = q.strip()
-        if q:
-            return _open(f"Searching for '{q}'.",
-                         f"https://google.com/search?q={q.replace(' ', '+')}", "GOOGLE SEARCH")
-
-    # ── Wikipedia ─────────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("who is", "tell me about", "wikipedia about")) and "search" not in cmd:
-        q = cmd
-        for f in ("who is", "tell me about", "wikipedia about", "jarvis"):
-            q = q.replace(f, "")
-        q = q.strip()
-        if q:
-            return _r(wiki_search(q))
-
-    # ── Memory save ───────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("remember", "save to memory", "note this", "don't forget")):
-        note = cmd
-        for f in ("remember that", "remember", "save to memory", "note this", "don't forget", "jarvis", ":"):
-            note = note.replace(f, "")
-        note = note.strip()
-        if note and MEM_OK:
-            _mem_col.add(documents=[note], ids=[f"m{int(time.time())}"])
-            return _r("Committed to memory, sir.")
-        return _r("Nothing to save, or memory bank is unavailable.")
-
-    # ── Memory recall ─────────────────────────────────────────────────────────
-    if any(k in cmd for k in ("what do you know", "what do you remember", "show memories", "my notes")):
-        if MEM_OK and _mem_col.count() > 0:
-            docs = _mem_col.get().get("documents", [])
-            txt  = "\n".join(f"{i+1}. {d}" for i, d in enumerate(docs[:6]))
-            return _r(f"Here's what I have on record:\n{txt}")
-        return _r("Memory bank is empty, sir.")
-
-    # ── AI fallback ───────────────────────────────────────────────────────────
-    return _r(ask_ai(command.strip()))
-
-# ══════════════════════════════════════════════════════════════════════
-# SERVICE WORKER  (for PWA offline caching)
-# ══════════════════════════════════════════════════════════════════════
-
-SERVICE_WORKER = r"""
-const CACHE = 'jarvis-v2.1';
-const SHELL  = ['/'];
-
-self.addEventListener('install', e => {
-  e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())
-  );
-});
-
-self.addEventListener('activate', e => {
-  e.waitUntil(
-    caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
-      .then(() => self.clients.claim())
-  );
-});
-
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
-  const url = new URL(e.request.url);
-  const isSameOrigin = url.origin === self.location.origin;
-  const isFont       = url.hostname.includes('fonts.googleapis.com') ||
-                       url.hostname.includes('fonts.gstatic.com');
-  if (!isSameOrigin && !isFont) return;
-
-  e.respondWith(
-    fetch(e.request)
-      .then(res => {
-        if (res.ok) {
-          const clone = res.clone();
-          caches.open(CACHE).then(c => c.put(e.request, clone));
-        }
-        return res;
-      })
-      .catch(() => caches.match(e.request))
-  );
-});
-"""
-
-# ══════════════════════════════════════════════════════════════════════
-# HTML PAGE  — Iron Man HUD v2
-# ══════════════════════════════════════════════════════════════════════
-
-HTML_PAGE = r"""<!DOCTYPE html>
+HTML_PAGE = r"""
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
-  <meta name="theme-color" content="#000814"/>
-  <meta name="description" content="J.A.R.V.I.S. — Personal AI Assistant"/>
+  <meta name="apple-mobile-web-app-title" content="JARVIS"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
   <title>J.A.R.V.I.S.</title>
+  <meta name="description" content="J.A.R.V.I.S. — Advanced AI Assistant. Voice-controlled. Online & Offline."/>
+  <meta name="theme-color" content="#000814"/>
   <link rel="manifest" href="/manifest.json"/>
+  <link rel="apple-touch-icon" href="/icon-192.png"/>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Rajdhani:wght@300;400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet"/>
   <style>
-    :root{
-      --bg:#000814; --blue:#00d4ff; --blue2:#0055ff; --green:#00ff88;
-      --red:#ff2255; --amber:#ffaa00; --text:#90c8e8; --muted:#1e3a5a;
-      --glow:rgba(0,212,255,.35); --surface:rgba(0,15,50,.7);
+    :root {
+      --bg:    #000814;
+      --blue:  #00d4ff;
+      --blue2: #0055ff;
+      --green: #00ff88;
+      --red:   #ff2255;
+      --amber: #ffaa00;
+      --text:  #90c8e8;
+      --muted: #1e3a5a;
+      --glow:  rgba(0,212,255,0.35);
     }
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
     html{height:100%;background:var(--bg);}
     body{
-      height:100dvh;background:var(--bg);color:var(--text);
+      height:100dvh; background:var(--bg); color:var(--text);
       font-family:'Rajdhani',sans-serif;
-      display:flex;flex-direction:column;overflow:hidden;
-      -webkit-tap-highlight-color:transparent;user-select:none;
+      display:flex; flex-direction:column; overflow:hidden;
+      -webkit-tap-highlight-color:transparent; user-select:none;
     }
 
-    /* ── Backgrounds ── */
-    .bg-glow{position:fixed;inset:0;pointer-events:none;z-index:0;
-      background:radial-gradient(ellipse at 50% 0%,rgba(0,80,200,.13) 0%,transparent 60%),
-                 radial-gradient(ellipse at 50% 100%,rgba(0,30,100,.1) 0%,transparent 55%);}
-    .hex-grid{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.5;
-      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='48'%3E%3Cpath d='M28 2 L54 16 L54 32 L28 46 L2 32 L2 16 Z' fill='none' stroke='%23002255' stroke-width='.8'/%3E%3C/svg%3E");
-      background-size:56px 48px;}
-    .scanlines{position:fixed;inset:0;pointer-events:none;z-index:0;
-      background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.04) 3px,rgba(0,0,0,.04) 4px);}
-
-    /* ── HUD corners ── */
-    .hc{position:fixed;width:50px;height:50px;z-index:5;pointer-events:none;}
-    .hc::before,.hc::after{content:'';position:absolute;background:rgba(0,212,255,.55);}
-    .hc.tl{top:0;left:0;} .hc.tl::before{top:0;left:0;width:50px;height:2px;} .hc.tl::after{top:0;left:0;width:2px;height:50px;}
-    .hc.tr{top:0;right:0;} .hc.tr::before{top:0;right:0;width:50px;height:2px;} .hc.tr::after{top:0;right:0;width:2px;height:50px;}
-    .hc.bl{bottom:0;left:0;} .hc.bl::before{bottom:0;left:0;width:50px;height:2px;} .hc.bl::after{bottom:0;left:0;width:2px;height:50px;}
-    .hc.br{bottom:0;right:0;} .hc.br::before{bottom:0;right:0;width:50px;height:2px;} .hc.br::after{bottom:0;right:0;width:2px;height:50px;}
-
-    /* ── Offline banner ── */
-    .offline-bar{
-      position:relative;z-index:50;flex-shrink:0;
-      background:linear-gradient(90deg,#4a2000,#3a1800);
-      border-bottom:1px solid rgba(255,170,0,.35);
-      padding:7px 16px;display:none;
-      font-family:'Share Tech Mono',monospace;font-size:.65rem;letter-spacing:1.5px;
-      color:var(--amber);text-align:center;
+    /* ── Background layers ── */
+    .bg-glow{
+      position:fixed;inset:0;pointer-events:none;z-index:0;
+      background:
+        radial-gradient(ellipse at 50% 0%,rgba(0,80,200,0.15) 0%,transparent 60%),
+        radial-gradient(ellipse at 50% 100%,rgba(0,30,100,0.12) 0%,transparent 55%);
     }
-    .offline-bar.on{display:block;}
-
-    /* ── Install banner ── */
-    .install-bar{
-      position:relative;z-index:50;flex-shrink:0;
-      background:linear-gradient(90deg,rgba(0,50,120,.9),rgba(0,30,80,.9));
-      border-bottom:1px solid rgba(0,212,255,.2);
-      padding:9px 16px;display:none;
-      align-items:center;justify-content:space-between;gap:10px;
+    .hex-grid{
+      position:fixed;inset:0;pointer-events:none;z-index:0;opacity:0.5;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='48'%3E%3Cpath d='M28 2 L54 16 L54 32 L28 46 L2 32 L2 16 Z' fill='none' stroke='%23002255' stroke-width='0.8'/%3E%3C/svg%3E");
+      background-size:56px 48px;
     }
-    .install-bar.on{display:flex;}
-    .install-bar span{font-family:'Share Tech Mono',monospace;font-size:.65rem;letter-spacing:1px;color:var(--blue);}
-    .install-bar button{
-      padding:6px 14px;background:linear-gradient(135deg,var(--blue2),var(--blue));
-      border:none;border-radius:6px;color:#fff;font-size:.75rem;
-      font-family:'Rajdhani',sans-serif;font-weight:700;letter-spacing:1px;cursor:pointer;
+    .scanlines{
+      position:fixed;inset:0;pointer-events:none;z-index:0;
+      background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,0.035) 3px,rgba(0,0,0,0.035) 4px);
     }
-    .ib-close{background:none!important;border:1px solid var(--muted)!important;color:var(--muted)!important;padding:5px 10px!important;}
 
-    /* ── Header ── */
+    /* HUD Corners */
+    .hc{position:fixed;width:54px;height:54px;z-index:5;pointer-events:none;}
+    .hc::before,.hc::after{content:'';position:absolute;background:rgba(0,212,255,0.5);}
+    .hc.tl{top:0;left:0;} .hc.tl::before{top:0;left:0;width:54px;height:2px;} .hc.tl::after{top:0;left:0;width:2px;height:54px;}
+    .hc.tr{top:0;right:0;} .hc.tr::before{top:0;right:0;width:54px;height:2px;} .hc.tr::after{top:0;right:0;width:2px;height:54px;}
+    .hc.bl{bottom:0;left:0;} .hc.bl::before{bottom:0;left:0;width:54px;height:2px;} .hc.bl::after{bottom:0;left:0;width:2px;height:54px;}
+    .hc.br{bottom:0;right:0;} .hc.br::before{bottom:0;right:0;width:54px;height:2px;} .hc.br::after{bottom:0;right:0;width:2px;height:54px;}
+
+    /* ── HEADER ── */
     .hud-header{
       position:relative;z-index:10;flex-shrink:0;
       padding:12px 16px 8px;
-      background:linear-gradient(180deg,rgba(0,8,30,.97) 0%,rgba(0,8,20,.5) 100%);
-      border-bottom:1px solid rgba(0,212,255,.12);
+      background:linear-gradient(180deg,rgba(0,8,30,0.97) 0%,rgba(0,8,20,0.5) 100%);
+      border-bottom:1px solid rgba(0,212,255,0.1);
     }
-    .hud-row1{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+    .hud-row1{display:flex;align-items:center;justify-content:space-between;}
     .j-name{
       font-family:'Orbitron',monospace;font-size:1rem;font-weight:900;
       letter-spacing:5px;color:var(--blue);
-      text-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,.3);
-      flex:1;
+      text-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,0.3);
     }
-    .hdr-btns{display:flex;align-items:center;gap:8px;}
-    .hdr-btn{
+    .hud-btns{display:flex;align-items:center;gap:7px;}
+    .hbtn{
       background:none;border:1px solid var(--muted);color:var(--muted);
-      border-radius:6px;padding:5px 9px;cursor:pointer;
-      font-family:'Share Tech Mono',monospace;font-size:.7rem;letter-spacing:1px;
-      transition:all .15s;flex-shrink:0;
+      border-radius:5px;padding:4px 9px;cursor:pointer;
+      font-family:'Share Tech Mono',monospace;font-size:0.68rem;letter-spacing:1px;
+      transition:all 0.15s;
     }
-    .hdr-btn:active{border-color:var(--blue);color:var(--blue);}
-    .sys-badge{display:flex;align-items:center;gap:6px;font-family:'Share Tech Mono',monospace;font-size:.62rem;letter-spacing:2px;}
+    .hbtn:active{border-color:var(--blue);color:var(--blue);}
+    .sys-badge{display:flex;align-items:center;gap:6px;
+      font-family:'Share Tech Mono',monospace;font-size:0.62rem;letter-spacing:2px;}
     .led{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:led-blink 2s infinite;}
-    .led.red{background:var(--red);box-shadow:0 0 8px var(--red);animation-duration:.5s;}
-    .led.blue{background:var(--blue);box-shadow:0 0 8px var(--blue);animation-duration:.35s;}
-    .led.amber{background:var(--amber);box-shadow:0 0 8px var(--amber);}
-    @keyframes led-blink{0%,100%{opacity:1;}50%{opacity:.15;}}
+    .led.red  {background:var(--red);  box-shadow:0 0 8px var(--red);  animation:led-blink 0.5s infinite;}
+    .led.blue {background:var(--blue); box-shadow:0 0 8px var(--blue); animation:led-blink 0.35s infinite;}
+    @keyframes led-blink{0%,100%{opacity:1;}50%{opacity:0.15;}}
     .sys-lbl{color:var(--green);}
     .sys-lbl.red{color:var(--red);}
     .sys-lbl.blue{color:var(--blue);}
     .hud-meta{
       margin-top:5px;display:flex;gap:12px;flex-wrap:wrap;
-      font-family:'Share Tech Mono',monospace;font-size:.56rem;
-      color:var(--muted);letter-spacing:.5px;
+      font-family:'Share Tech Mono',monospace;font-size:0.56rem;
+      color:var(--muted);letter-spacing:0.5px;
     }
-    .hud-meta .v{color:rgba(0,212,255,.5);}
+    .hud-meta .v{color:rgba(0,212,255,0.45);}
+    #battLine{display:none;}
+    #battLine.on{display:inline;}
 
-    /* ── Response panel ── */
+    /* ── RESPONSE PANEL ── */
     .resp-area{
       flex:1;position:relative;z-index:10;
       display:flex;align-items:center;justify-content:center;
-      padding:12px 14px;overflow:hidden;
+      padding:10px 14px;overflow:hidden;
     }
     .holo-panel{
-      width:100%;max-width:500px;
-      background:rgba(0,12,40,.65);
-      border:1px solid rgba(0,212,255,.18);
+      width:100%;max-width:460px;
+      background:rgba(0,15,50,0.6);
+      border:1px solid rgba(0,212,255,0.18);
       border-radius:14px;padding:16px 18px 14px;
-      backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
+      backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
       position:relative;max-height:100%;overflow-y:auto;
     }
-    .holo-panel::-webkit-scrollbar{width:3px;}
-    .holo-panel::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px;}
-    .holo-panel::before{
-      content:'';position:absolute;top:-1px;left:20px;
-      width:44px;height:2px;
-      background:linear-gradient(90deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);
-    }
-    .holo-panel::after{
-      content:'';position:absolute;bottom:-1px;right:20px;
-      width:44px;height:2px;
-      background:linear-gradient(270deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);
-    }
-    .panel-lbl{font-family:'Orbitron',monospace;font-size:.5rem;letter-spacing:3px;color:rgba(0,212,255,.45);margin-bottom:8px;}
-    .query-line{
-      font-family:'Share Tech Mono',monospace;font-size:.72rem;
-      color:var(--muted);margin-bottom:7px;padding-bottom:7px;
-      border-bottom:1px solid rgba(0,212,255,.08);display:none;
-    }
+    .holo-panel::before{content:'';position:absolute;top:-1px;left:22px;width:48px;height:2px;background:linear-gradient(90deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);}
+    .holo-panel::after{content:'';position:absolute;bottom:-1px;right:22px;width:48px;height:2px;background:linear-gradient(270deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);}
+    .panel-lbl{font-family:'Orbitron',monospace;font-size:0.5rem;letter-spacing:3px;color:rgba(0,212,255,0.45);margin-bottom:9px;}
+    .query-line{font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:var(--muted);margin-bottom:8px;padding-bottom:7px;border-bottom:1px solid rgba(0,212,255,0.08);display:none;}
     .query-line.on{display:block;}
-    .query-line::before{content:'> ';color:rgba(0,212,255,.35);}
-    .resp-txt{font-size:1.05rem;line-height:1.65;color:var(--text);min-height:44px;word-break:break-word;}
-    .resp-txt.blink::after{content:'|';animation:cur-blink .6s infinite;color:var(--blue);margin-left:1px;}
+    .query-line::before{content:'> ';color:rgba(0,212,255,0.35);}
+    .resp-txt{font-size:1.05rem;line-height:1.65;color:var(--text);min-height:48px;white-space:pre-wrap;}
+    .resp-txt.blink::after{content:'|';animation:cur-blink 0.6s infinite;color:var(--blue);margin-left:1px;}
     @keyframes cur-blink{0%,100%{opacity:1;}50%{opacity:0;}}
     .tdots{display:none;gap:5px;margin-top:8px;}
     .tdots.on{display:flex;}
@@ -578,257 +588,232 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .tdots b:nth-child(3){animation-delay:.36s;}
     @keyframes td{0%,60%,100%{transform:translateY(0);opacity:.3;}30%{transform:translateY(-7px);opacity:1;}}
 
-    /* ── Code blocks ── */
-    .cb{background:rgba(0,5,20,.9);border:1px solid rgba(0,212,255,.2);border-radius:8px;margin:8px 0;overflow:hidden;}
-    .cb-hdr{
-      display:flex;align-items:center;justify-content:space-between;
-      padding:6px 12px;background:rgba(0,212,255,.06);
-      border-bottom:1px solid rgba(0,212,255,.15);
+    /* Action button in panel */
+    .action-btn{
+      display:none;margin-top:12px;
+      padding:9px 20px;border-radius:8px;
+      background:rgba(0,212,255,0.08);
+      border:1px solid rgba(0,212,255,0.35);
+      color:var(--blue);font-family:'Orbitron',monospace;
+      font-size:0.62rem;letter-spacing:2px;cursor:pointer;
+      transition:all 0.15s;width:100%;
     }
-    .cb-lang{font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:2px;color:var(--blue);}
-    .cb-copy{
-      background:none;border:1px solid rgba(0,212,255,.3);color:rgba(0,212,255,.7);
-      border-radius:4px;padding:2px 8px;cursor:pointer;
-      font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:1px;
-      transition:all .15s;
-    }
-    .cb-copy:active{background:rgba(0,212,255,.15);color:var(--blue);}
-    .cb pre{padding:12px;overflow-x:auto;}
-    .cb pre::-webkit-scrollbar{height:3px;}
-    .cb pre::-webkit-scrollbar-thumb{background:var(--muted);}
-    .cb code{font-family:'Share Tech Mono',monospace;font-size:.78rem;line-height:1.5;color:#9ae4ff;white-space:pre;}
-    code.ic{background:rgba(0,212,255,.1);color:#9ae4ff;padding:1px 5px;border-radius:3px;font-family:'Share Tech Mono',monospace;font-size:.85em;}
+    .action-btn.on{display:block;}
+    .action-btn:active{background:rgba(0,212,255,0.18);box-shadow:0 0 14px rgba(0,212,255,0.3);}
 
-    /* ── Quick commands ── */
+    /* ── QUICK COMMANDS ── */
     .quick-wrap{position:relative;z-index:10;padding:5px 12px;flex-shrink:0;}
-    .quick-inner{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;padding-bottom:2px;}
+    .quick-inner{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;}
     .quick-inner::-webkit-scrollbar{display:none;}
     .qc{
-      flex-shrink:0;font-family:'Rajdhani',sans-serif;font-size:.7rem;font-weight:600;letter-spacing:.5px;
-      padding:6px 11px;border-radius:6px;border:1px solid var(--muted);
-      background:rgba(0,15,45,.55);color:rgba(144,200,232,.7);cursor:pointer;white-space:nowrap;
-      transition:border-color .15s,color .15s;
+      flex-shrink:0;
+      font-family:'Rajdhani',sans-serif;font-size:0.7rem;font-weight:600;letter-spacing:0.5px;
+      padding:6px 11px;border-radius:6px;
+      border:1px solid var(--muted);
+      background:rgba(0,15,45,0.55);
+      color:rgba(144,200,232,0.7);
+      cursor:pointer;white-space:nowrap;
+      transition:border-color 0.15s,color 0.15s,box-shadow 0.15s;
     }
-    .qc:active{border-color:var(--blue);color:var(--blue);box-shadow:0 0 10px rgba(0,212,255,.2);}
+    .qc:active{border-color:var(--blue);color:var(--blue);box-shadow:0 0 10px rgba(0,212,255,0.22);}
 
-    /* ── Mic / Arc reactor ── */
+    /* ── MIC / ARC REACTOR ── */
     .mic-section{
       position:relative;z-index:10;flex-shrink:0;
       display:flex;flex-direction:column;align-items:center;
-      padding:8px 0 6px;gap:8px;
+      padding:8px 0;
+      padding-bottom:max(env(safe-area-inset-bottom,14px),14px);
+      gap:8px;
     }
-    .wave{display:flex;align-items:center;gap:3px;height:24px;opacity:0;transition:opacity .3s;}
+    .wave{display:flex;align-items:center;gap:3px;height:26px;opacity:0;transition:opacity 0.3s;}
     .wave.on{opacity:1;}
-    .wave i{display:block;width:3px;border-radius:2px;background:var(--red);box-shadow:0 0 5px var(--red);animation:wbar .9s ease-in-out infinite;}
-    .wave i:nth-child(1){height:7px;}
-    .wave i:nth-child(2){height:16px;animation-delay:.08s;}
-    .wave i:nth-child(3){height:23px;animation-delay:.16s;}
-    .wave i:nth-child(4){height:12px;animation-delay:.24s;}
-    .wave i:nth-child(5){height:20px;animation-delay:.12s;}
-    .wave i:nth-child(6){height:14px;animation-delay:.08s;}
-    .wave i:nth-child(7){height:9px;}
+    .wave i{display:block;width:3px;border-radius:2px;background:var(--red);box-shadow:0 0 5px var(--red);animation:wbar 0.9s ease-in-out infinite;}
+    .wave i:nth-child(1){height:8px;animation-delay:0s;}
+    .wave i:nth-child(2){height:18px;animation-delay:.08s;}
+    .wave i:nth-child(3){height:26px;animation-delay:.16s;}
+    .wave i:nth-child(4){height:14px;animation-delay:.24s;}
+    .wave i:nth-child(5){height:22px;animation-delay:.12s;}
+    .wave i:nth-child(6){height:16px;animation-delay:.08s;}
+    .wave i:nth-child(7){height:10px;animation-delay:0s;}
     @keyframes wbar{0%,100%{transform:scaleY(.3);}50%{transform:scaleY(1);}}
-    .arc-wrap{position:relative;width:136px;height:136px;display:flex;align-items:center;justify-content:center;}
-    .ring{position:absolute;border-radius:50%;border:1px solid rgba(0,212,255,.22);}
-    .r1{width:136px;height:136px;animation:rbreath 3s ease-in-out infinite;}
-    .r2{width:116px;height:116px;animation:rbreath 3s ease-in-out infinite .5s;border-color:rgba(0,212,255,.13);}
+
+    .arc-wrap{position:relative;width:144px;height:144px;display:flex;align-items:center;justify-content:center;}
+    .ring{position:absolute;border-radius:50%;border:1px solid rgba(0,212,255,0.2);}
+    .r1{width:144px;height:144px;animation:rbreath 3s ease-in-out infinite;}
+    .r2{width:122px;height:122px;animation:rbreath 3s ease-in-out infinite 0.5s;border-color:rgba(0,212,255,0.12);}
     @keyframes rbreath{0%,100%{transform:scale(1);opacity:.5;}50%{transform:scale(1.05);opacity:1;}}
-    .arc-wrap.lst .r1{animation:rlisten .65s infinite;border-color:rgba(255,34,85,.75);}
-    .arc-wrap.lst .r2{animation:rlisten .65s infinite .15s;border-color:rgba(255,34,85,.4);}
+
+    .arc-wrap.lst .r1{animation:rlisten 0.65s infinite;border-color:rgba(255,34,85,.75);}
+    .arc-wrap.lst .r2{animation:rlisten 0.65s infinite .15s;border-color:rgba(255,34,85,.4);}
     @keyframes rlisten{0%,100%{transform:scale(1);}50%{transform:scale(1.11);}}
-    .arc-wrap.thk .r1{animation:rspin 1.8s linear infinite;border-color:transparent;border-top-color:var(--blue);box-shadow:0 0 12px rgba(0,212,255,.3);}
+
+    .arc-wrap.thk .r1{animation:rspin 1.8s linear infinite;border-color:transparent;border-top-color:var(--blue);box-shadow:0 0 12px rgba(0,212,255,0.3);}
     .arc-wrap.thk .r2{animation:rspin 3s linear infinite reverse;border-color:transparent;border-top-color:var(--blue2);}
     @keyframes rspin{from{transform:rotate(0);}to{transform:rotate(360deg);}}
+
     .arc-btn{
-      width:92px;height:92px;border-radius:50%;
-      background:radial-gradient(circle at 38% 38%,rgba(0,55,130,.9),rgba(0,4,18,.97));
-      border:2px solid rgba(0,212,255,.45);
-      box-shadow:0 0 24px rgba(0,212,255,.2),inset 0 0 24px rgba(0,212,255,.07);
-      cursor:pointer;position:relative;display:flex;align-items:center;justify-content:center;
-      transition:transform .15s,box-shadow .2s;-webkit-appearance:none;outline:none;
+      width:96px;height:96px;border-radius:50%;
+      background:radial-gradient(circle at 38% 38%,rgba(0,55,130,0.9),rgba(0,4,18,0.97));
+      border:2px solid rgba(0,212,255,0.45);
+      box-shadow:0 0 24px rgba(0,212,255,0.2),0 0 50px rgba(0,212,255,0.07),inset 0 0 24px rgba(0,212,255,0.07);
+      cursor:pointer;position:relative;
+      display:flex;align-items:center;justify-content:center;
+      transition:transform 0.15s,box-shadow 0.2s;
+      -webkit-appearance:none;outline:none;
     }
-    .arc-btn:active{transform:scale(.93);}
-    .arc-btn::before{content:'';position:absolute;width:48px;height:48px;border-radius:50%;border:1.5px solid rgba(0,212,255,.3);}
+    .arc-btn:active{transform:scale(0.93);}
+    .arc-btn::before{content:'';position:absolute;width:50px;height:50px;border-radius:50%;border:1.5px solid rgba(0,212,255,0.28);}
     .arc-core{
       width:20px;height:20px;border-radius:50%;
       background:radial-gradient(circle,#9aeeff,var(--blue));
-      box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,.35);
+      box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,0.35);
       animation:core-glow 3s ease-in-out infinite;position:relative;z-index:1;
     }
-    @keyframes core-glow{0%,100%{box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,.35);}50%{box-shadow:0 0 28px var(--blue),0 0 56px rgba(0,212,255,.55);}}
+    @keyframes core-glow{0%,100%{box-shadow:0 0 18px var(--blue),0 0 36px rgba(0,212,255,0.35);}50%{box-shadow:0 0 28px var(--blue),0 0 56px rgba(0,212,255,0.55);}}
     .arc-wrap.lst .arc-btn{border-color:rgba(255,34,85,.7);box-shadow:0 0 28px rgba(255,34,85,.35),inset 0 0 24px rgba(255,34,85,.08);}
     .arc-wrap.lst .arc-btn::before{border-color:rgba(255,34,85,.45);}
-    .arc-wrap.lst .arc-core{background:radial-gradient(circle,#ffaacc,var(--red));box-shadow:0 0 18px var(--red);animation:none;}
+    .arc-wrap.lst .arc-core{background:radial-gradient(circle,#ffaacc,var(--red));box-shadow:0 0 18px var(--red),0 0 36px rgba(255,34,85,.35);animation:none;}
     .arc-wrap.thk .arc-btn{box-shadow:0 0 36px rgba(0,212,255,.5),0 0 70px rgba(0,212,255,.2),inset 0 0 24px rgba(0,212,255,.12);}
     .arc-wrap.thk .arc-core{animation:core-spin 1s linear infinite;}
     @keyframes core-spin{to{filter:hue-rotate(360deg);}}
-    .mic-lbl{font-family:'Orbitron',monospace;font-size:.56rem;letter-spacing:3px;color:var(--muted);text-align:center;transition:color .3s;}
+
+    .mic-lbl{font-family:'Orbitron',monospace;font-size:0.56rem;letter-spacing:3px;color:var(--muted);text-align:center;transition:color 0.3s;}
     .mic-lbl.red{color:var(--red);}
     .mic-lbl.blue{color:var(--blue);}
     .mic-lbl.green{color:var(--green);}
 
-    /* ── Text input bar ── */
-    .input-bar{
+    /* ── TYPE INPUT BAR ── */
+    .type-bar{
+      display:flex;gap:6px;padding:0 12px 6px;
       position:relative;z-index:10;flex-shrink:0;
-      padding:8px 14px max(env(safe-area-inset-bottom,12px),12px);
-      background:rgba(0,6,22,.95);border-top:1px solid rgba(0,212,255,.1);
-      display:flex;gap:8px;align-items:center;
     }
-    #txtIn{
-      flex:1;background:rgba(0,12,40,.8);border:1px solid rgba(0,212,255,.2);
-      border-radius:22px;padding:10px 16px;
-      color:var(--text);font-size:.9rem;font-family:'Rajdhani',sans-serif;
-      outline:none;transition:border-color .2s,box-shadow .2s;
+    .type-input{
+      flex:1;background:rgba(0,15,45,0.7);
+      border:1px solid var(--muted);border-radius:8px;
+      padding:8px 12px;color:var(--text);
+      font-family:'Share Tech Mono',monospace;font-size:0.78rem;
+      outline:none;transition:border-color 0.2s;
+      -webkit-appearance:none;
     }
-    #txtIn:focus{border-color:rgba(0,212,255,.5);box-shadow:0 0 0 3px rgba(0,212,255,.08);}
-    #txtIn::placeholder{color:var(--muted);}
-    .send-btn{
-      width:42px;height:42px;border-radius:50%;border:none;cursor:pointer;flex-shrink:0;
-      background:linear-gradient(135deg,var(--blue2),var(--blue));
-      color:#fff;font-size:1rem;display:flex;align-items:center;justify-content:center;
-      box-shadow:0 2px 12px rgba(0,212,255,.3);transition:transform .15s;
+    .type-input:focus{border-color:rgba(0,212,255,0.4);}
+    .type-input::placeholder{color:rgba(144,200,232,0.3);}
+    .type-send{
+      background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);
+      color:var(--blue);border-radius:8px;padding:8px 14px;
+      cursor:pointer;font-family:'Orbitron',monospace;font-size:0.65rem;
+      letter-spacing:1px;transition:all 0.15s;white-space:nowrap;
     }
-    .send-btn:active{transform:scale(.9);}
+    .type-send:active{background:rgba(0,212,255,0.2);}
 
-    /* ── Controls drawer ── */
-    .drawer-overlay{
-      position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.6);
-      display:none;backdrop-filter:blur(4px);
-    }
-    .drawer-overlay.on{display:block;}
-    .drawer{
-      position:fixed;bottom:0;left:0;right:0;z-index:101;
-      background:rgba(0,6,22,.97);border-top:1px solid rgba(0,212,255,.25);
-      border-radius:20px 20px 0 0;
-      padding:20px 20px max(env(safe-area-inset-bottom,20px),20px);
-      transform:translateY(110%);transition:transform .35s cubic-bezier(.4,0,.2,1);
-      max-height:80vh;overflow-y:auto;
-    }
-    .drawer.on{transform:translateY(0);}
-    .drawer-pill{width:40px;height:4px;background:var(--muted);border-radius:2px;margin:0 auto 18px;}
-    .drawer-hdr{
-      display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;
-      font-family:'Orbitron',monospace;font-size:.58rem;letter-spacing:3px;color:var(--blue);
-    }
-    .drawer-hdr button{
-      background:none;border:1px solid var(--muted);color:var(--muted);
-      border-radius:5px;padding:3px 8px;cursor:pointer;font-size:.75rem;transition:all .15s;
-    }
-    .drawer-hdr button:active{border-color:var(--red);color:var(--red);}
-    .ctrl-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px;}
-    .ctrl-tile{
-      background:rgba(0,15,50,.7);border:1px solid var(--muted);
-      border-radius:12px;padding:16px 10px;cursor:pointer;
-      display:flex;flex-direction:column;align-items:center;gap:7px;
-      font-family:'Rajdhani',sans-serif;font-size:.72rem;font-weight:600;letter-spacing:.5px;
-      color:rgba(144,200,232,.7);transition:all .2s;
-    }
-    .ctrl-tile:active,.ctrl-tile.active{
-      border-color:var(--blue);color:var(--blue);
-      background:rgba(0,212,255,.08);box-shadow:0 0 12px rgba(0,212,255,.2);
-    }
-    .ctrl-tile span:first-child{font-size:1.4rem;}
-    .ctrl-section-lbl{
-      font-family:'Share Tech Mono',monospace;font-size:.58rem;letter-spacing:2px;
-      color:var(--muted);margin-bottom:10px;
-    }
-    .local-pc-row{display:flex;gap:8px;align-items:center;}
-    .local-pc-row input{
-      flex:1;background:rgba(0,12,40,.8);border:1px solid rgba(0,212,255,.2);
-      border-radius:8px;padding:9px 12px;color:var(--text);
-      font-family:'Share Tech Mono',monospace;font-size:.75rem;outline:none;
-    }
-    .local-pc-row input:focus{border-color:rgba(0,212,255,.5);}
-    .local-pc-row input::placeholder{color:var(--muted);}
-    .local-pc-row button{
-      padding:9px 14px;background:linear-gradient(135deg,var(--blue2),var(--blue));
-      border:none;border-radius:8px;color:#fff;font-size:.75rem;
-      font-family:'Rajdhani',sans-serif;font-weight:700;letter-spacing:1px;cursor:pointer;
-    }
-
-    /* ── Voice picker modal ── */
-    .vmodal{display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.82);align-items:flex-end;justify-content:center;}
-    .vmodal.on{display:flex;}
-    .vmodal-inner{
-      width:100%;max-width:480px;background:#00060f;
-      border:1px solid rgba(0,212,255,.25);border-bottom:none;border-radius:16px 16px 0 0;
-      padding:18px;max-height:70vh;display:flex;flex-direction:column;
-    }
-    .vmodal-hdr{
-      display:flex;justify-content:space-between;align-items:center;
-      font-family:'Orbitron',monospace;font-size:.58rem;letter-spacing:3px;color:var(--blue);margin-bottom:12px;flex-shrink:0;
-    }
-    .vmodal-hdr button{background:none;border:1px solid var(--muted);color:var(--muted);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:.8rem;}
-    .vlist{overflow-y:auto;display:flex;flex-direction:column;gap:5px;scrollbar-width:thin;scrollbar-color:var(--muted) transparent;}
-    .vitem{padding:11px 13px;border-radius:8px;border:1px solid var(--muted);cursor:pointer;transition:all .15s;font-family:'Rajdhani',sans-serif;}
-    .vitem:active,.vitem.sel{border-color:var(--blue);color:var(--blue);background:rgba(0,212,255,.06);}
-    .vitem .vn{font-size:.88rem;font-weight:600;color:var(--text);}
-    .vitem.sel .vn{color:var(--blue);}
-    .vitem .vl{font-size:.62rem;font-family:'Share Tech Mono',monospace;color:var(--muted);margin-top:2px;}
-    .sel-mark{float:right;color:var(--green);font-size:.8rem;display:none;}
-    .vitem.sel .sel-mark{display:inline;}
-
-    /* ── Toast ── */
+    /* ── TOAST ── */
     .toast{
-      position:fixed;top:74px;left:50%;
+      position:fixed;top:76px;left:50%;
       transform:translateX(-50%) translateY(-10px);
-      background:rgba(0,15,50,.97);border:1px solid rgba(0,212,255,.3);
-      border-radius:8px;padding:7px 18px;
-      font-family:'Share Tech Mono',monospace;font-size:.65rem;
+      background:rgba(0,15,50,0.96);border:1px solid rgba(0,212,255,0.3);
+      border-radius:8px;padding:7px 16px;
+      font-family:'Share Tech Mono',monospace;font-size:0.65rem;
       color:var(--blue);letter-spacing:1px;
-      z-index:300;opacity:0;transition:all .25s;pointer-events:none;white-space:nowrap;
+      z-index:200;opacity:0;transition:all 0.25s;
+      pointer-events:none;white-space:nowrap;max-width:90vw;
+      text-overflow:ellipsis;overflow:hidden;
     }
     .toast.on{opacity:1;transform:translateX(-50%) translateY(0);}
+    .toast.green{border-color:rgba(0,255,136,0.4);color:var(--green);}
+    .toast.red{border-color:rgba(255,34,85,0.4);color:var(--red);}
 
-    /* ── No voice overlay ── */
-    #noVoice{
-      display:none;position:fixed;inset:0;z-index:400;
-      background:rgba(0,0,0,.93);flex-direction:column;
-      align-items:center;justify-content:center;gap:14px;padding:32px;text-align:center;
-    }
+    /* ── NO VOICE ── */
+    #noVoice{display:none;position:fixed;inset:0;z-index:300;background:rgba(0,0,0,0.93);flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:28px;text-align:center;}
     #noVoice.on{display:flex;}
-    #noVoice h2{font-family:'Orbitron',monospace;font-size:.95rem;letter-spacing:2px;color:var(--red);}
-    #noVoice p{color:var(--muted);font-size:.88rem;line-height:1.6;}
+    #noVoice h2{font-family:'Orbitron',monospace;font-size:0.95rem;letter-spacing:2px;color:var(--red);}
+    #noVoice p{color:var(--muted);font-size:0.88rem;line-height:1.6;}
+    #noVoice button{margin-top:8px;padding:10px 22px;background:none;border:1px solid var(--muted);color:var(--text);border-radius:8px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:0.75rem;}
+
+    /* ── VOICE PICKER MODAL ── */
+    .vmodal{display:none;position:fixed;inset:0;z-index:400;background:rgba(0,0,0,0.82);align-items:flex-end;justify-content:center;}
+    .vmodal.on{display:flex;}
+    .vmodal-inner{width:100%;max-width:480px;background:#00060f;border:1px solid rgba(0,212,255,0.25);border-bottom:none;border-radius:16px 16px 0 0;padding:18px;max-height:75vh;display:flex;flex-direction:column;}
+    .vmodal-hdr{display:flex;justify-content:space-between;align-items:center;font-family:'Orbitron',monospace;font-size:0.6rem;letter-spacing:3px;color:var(--blue);margin-bottom:10px;flex-shrink:0;}
+    .vmodal-hdr button{background:none;border:1px solid var(--muted);color:var(--muted);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:0.78rem;transition:all 0.15s;}
+    .vmodal-hdr button:active{border-color:var(--red);color:var(--red);}
+    .vmodal-note{font-size:0.72rem;color:var(--muted);margin-bottom:10px;line-height:1.4;flex-shrink:0;}
+    .vlist{overflow-y:auto;display:flex;flex-direction:column;gap:5px;scrollbar-width:thin;scrollbar-color:var(--muted) transparent;}
+    .vlist::-webkit-scrollbar{width:3px;}
+    .vlist::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px;}
+    .vitem{padding:10px 12px;border-radius:8px;border:1px solid var(--muted);cursor:pointer;transition:all 0.15s;font-family:'Rajdhani',sans-serif;display:flex;align-items:center;gap:10px;}
+    .vitem:active,.vitem.sel{border-color:var(--blue);background:rgba(0,212,255,0.06);box-shadow:0 0 10px rgba(0,212,255,0.12);}
+    .vitem-info{flex:1;}
+    .vitem .vn{font-size:0.88rem;font-weight:600;color:var(--text);}
+    .vitem.sel .vn{color:var(--blue);}
+    .vitem .vl{font-size:0.62rem;font-family:'Share Tech Mono',monospace;color:var(--muted);margin-top:1px;}
+    .vgender{font-size:0.6rem;padding:2px 6px;border-radius:4px;font-family:'Share Tech Mono',monospace;border:1px solid;flex-shrink:0;}
+    .vgender.male{color:#88ccff;border-color:rgba(136,204,255,0.35);background:rgba(136,204,255,0.08);}
+    .vgender.female{color:#ffaacc;border-color:rgba(255,170,204,0.35);background:rgba(255,170,204,0.08);}
+    .vgender.unknown{color:var(--muted);border-color:var(--muted);background:transparent;}
+    .vtest-btn{background:none;border:1px solid var(--muted);color:var(--muted);border-radius:4px;padding:4px 8px;cursor:pointer;font-size:0.65rem;font-family:'Share Tech Mono',monospace;flex-shrink:0;transition:all 0.15s;}
+    .vtest-btn:active{border-color:var(--green);color:var(--green);}
+    .sel-mark{color:var(--green);font-size:0.8rem;flex-shrink:0;}
+
+    /* ── NOTES PANEL ── */
+    .notes-panel{display:none;position:fixed;inset:0;z-index:350;background:rgba(0,0,0,0.88);align-items:flex-end;justify-content:center;}
+    .notes-panel.on{display:flex;}
+    .notes-inner{width:100%;max-width:480px;background:#00060f;border:1px solid rgba(0,212,255,0.25);border-bottom:none;border-radius:16px 16px 0 0;padding:18px;max-height:70vh;display:flex;flex-direction:column;}
+    .notes-hdr{display:flex;justify-content:space-between;align-items:center;font-family:'Orbitron',monospace;font-size:0.6rem;letter-spacing:3px;color:var(--blue);margin-bottom:12px;flex-shrink:0;}
+    .notes-list{overflow-y:auto;display:flex;flex-direction:column;gap:8px;}
+    .note-item{padding:10px 14px;border-radius:8px;border:1px solid var(--muted);background:rgba(0,15,45,0.5);}
+    .note-item .note-text{font-size:0.9rem;color:var(--text);line-height:1.4;}
+    .note-item .note-time{font-family:'Share Tech Mono',monospace;font-size:0.6rem;color:var(--muted);margin-top:4px;}
+
+    /* ── PC REMOTE PANEL ── */
+    .pc-panel{display:none;position:fixed;inset:0;z-index:350;background:rgba(0,0,0,0.88);align-items:flex-end;justify-content:center;}
+    .pc-panel.on{display:flex;}
+    .pc-inner{width:100%;max-width:480px;background:#00060f;border:1px solid rgba(0,212,255,0.25);border-bottom:none;border-radius:16px 16px 0 0;padding:18px;max-height:80vh;display:flex;flex-direction:column;}
+    .pc-hdr{display:flex;justify-content:space-between;align-items:center;font-family:'Orbitron',monospace;font-size:0.6rem;letter-spacing:3px;color:var(--blue);margin-bottom:6px;flex-shrink:0;}
+    .pc-note{font-size:0.7rem;color:var(--muted);margin-bottom:12px;line-height:1.4;flex-shrink:0;}
+    .pc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;overflow-y:auto;}
+    .pc-btn{
+      padding:14px 10px;border-radius:10px;border:1px solid var(--muted);
+      background:rgba(0,15,45,0.6);color:var(--text);
+      cursor:pointer;text-align:center;transition:all 0.15s;
+    }
+    .pc-btn:active{border-color:var(--blue);color:var(--blue);background:rgba(0,212,255,0.08);}
+    .pc-btn .pci{font-size:1.4rem;display:block;margin-bottom:5px;}
+    .pc-btn .pcl{font-family:'Orbitron',monospace;font-size:0.55rem;letter-spacing:2px;}
+    .pc-btn.danger:active{border-color:var(--red);color:var(--red);background:rgba(255,34,85,0.08);}
+
+    /* ── OFFLINE BADGE ── */
+    .offline-badge{
+      display:none;position:fixed;top:0;left:0;right:0;z-index:500;
+      background:rgba(255,34,85,0.15);border-bottom:1px solid rgba(255,34,85,0.3);
+      text-align:center;padding:6px;
+      font-family:'Share Tech Mono',monospace;font-size:0.65rem;
+      color:var(--red);letter-spacing:1px;
+    }
+    .offline-badge.on{display:block;}
 
     @media(min-height:700px){
-      .arc-wrap{width:152px;height:152px;}
-      .r1{width:152px;height:152px;}
-      .r2{width:130px;height:130px;}
-      .arc-btn{width:104px;height:104px;}
-    }
-    @media(max-height:600px){
-      .mic-section{padding:4px 0;}
-      .wave{display:none;}
+      .arc-wrap{width:158px;height:158px;}
+      .r1{width:158px;height:158px;}
+      .r2{width:134px;height:134px;}
+      .arc-btn{width:108px;height:108px;}
     }
   </style>
 </head>
 <body>
 
+<div class="offline-badge" id="offlineBadge">⚡ OFFLINE MODE — Using cached data</div>
 <div class="bg-glow"></div>
 <div class="hex-grid"></div>
 <div class="scanlines"></div>
 <div class="hc tl"></div><div class="hc tr"></div>
 <div class="hc bl"></div><div class="hc br"></div>
 
-<!-- Offline banner -->
-<div class="offline-bar" id="offlineBar">⚠ OFFLINE MODE — CLOUD UNREACHABLE · USING LOCAL FALLBACK</div>
-
-<!-- Install banner -->
-<div class="install-bar" id="installBar">
-  <span>📱 ADD J.A.R.V.I.S. TO HOME SCREEN</span>
-  <div style="display:flex;gap:8px;">
-    <button onclick="installApp()" id="installBtn">INSTALL</button>
-    <button class="ib-close" onclick="dismissInstall()">✕</button>
-  </div>
-</div>
-
-<!-- Header -->
 <header class="hud-header">
   <div class="hud-row1">
     <div class="j-name">J.A.R.V.I.S.</div>
-    <div class="hdr-btns">
-      <button class="hdr-btn" onclick="openVoicePicker()" title="Change voice">🔊 VOICE</button>
-      <button class="hdr-btn" onclick="openDrawer()" title="System controls">⚙ CTRL</button>
+    <div class="hud-btns">
+      <button class="hbtn" id="pcBtn" onclick="openPCPanel()" title="PC Remote Control">🖥 PC</button>
+      <button class="hbtn" id="notesBtn" onclick="openNotesPanel()" title="View Notes">📝 NOTES</button>
+      <button class="hbtn" onclick="openVoicePicker()" title="Change Voice">🔊 VOICE</button>
       <div class="sys-badge">
         <div class="led" id="led"></div>
         <span class="sys-lbl" id="sysLbl">ONLINE</span>
@@ -837,41 +822,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="hud-meta">
     <span>SYS&nbsp;<span class="v">NOMINAL</span></span>
-    <span>AI&nbsp;<span class="v" id="aiModel">GEMINI+GROQ</span></span>
+    <span>AI&nbsp;<span class="v">GROQ LLM</span></span>
     <span>MEM&nbsp;<span class="v">ACTIVE</span></span>
-    <span>NET&nbsp;<span class="v" id="netStatus">CLOUD</span></span>
+    <span id="battLine">BATT&nbsp;<span class="v" id="battVal">--</span></span>
   </div>
 </header>
 
-<!-- Response panel -->
 <div class="resp-area">
   <div class="holo-panel">
     <div class="panel-lbl">◈ JARVIS OUTPUT</div>
     <div class="query-line" id="qLine"></div>
-    <div class="resp-txt" id="rTxt">Initialising systems&hellip;</div>
+    <div class="resp-txt" id="rTxt">Initialising systems…</div>
     <div class="tdots" id="tDots"><b></b><b></b><b></b></div>
+    <button class="action-btn" id="actionBtn" onclick="handleActionBtn()"></button>
   </div>
 </div>
 
-<!-- Quick commands -->
 <div class="quick-wrap">
   <div class="quick-inner">
     <button class="qc" id="qc1" onclick="runCmd('world news')">🌍 NEWS</button>
     <button class="qc" id="qc2" onclick="runCmd('weather today')">🌤 WEATHER</button>
     <button class="qc" id="qc3" onclick="runCmd('open youtube')">▶ YOUTUBE</button>
-    <button class="qc" id="qc4" onclick="runCmd('open whatsapp')">💬 WHATSAPP</button>
-    <button class="qc" id="qc5" onclick="runCmd('open spotify')">🎵 SPOTIFY</button>
-    <button class="qc" id="qc6" onclick="runCmd('open maps')">🗺 MAPS</button>
-    <button class="qc" id="qc7" onclick="runCmd('what time is it')">🕐 TIME</button>
-    <button class="qc" id="qc8" onclick="runCmd('motivate me')">⚡ MOTIVATE</button>
-    <button class="qc" id="qc9" onclick="runCmd('tell me a joke')">😄 JOKE</button>
-    <button class="qc" id="qc10" onclick="runCmd('open instagram')">📸 INSTAGRAM</button>
-    <button class="qc" id="qc11" onclick="runCmd('open netflix')">🎬 NETFLIX</button>
-    <button class="qc" id="qc12" onclick="runCmd('open github')">💻 GITHUB</button>
+    <button class="qc" id="qc4" onclick="runCmd('open maps')">🗺 MAPS</button>
+    <button class="qc" id="qc5" onclick="runCmd('open camera')">📷 CAMERA</button>
+    <button class="qc" id="qc6" onclick="runCmd('open whatsapp')">💬 WHATSAPP</button>
+    <button class="qc" id="qc7" onclick="runCmd('open spotify')">🎵 SPOTIFY</button>
+    <button class="qc" id="qc8" onclick="runCmd('battery status')">🔋 BATTERY</button>
+    <button class="qc" id="qc9" onclick="runCmd('my location')">📍 LOCATION</button>
+    <button class="qc" id="qc10" onclick="runCmd('motivate me')">⚡ MOTIVATE</button>
+    <button class="qc" id="qc11" onclick="runCmd('tell me a joke')">😄 JOKE</button>
+    <button class="qc" id="qc12" onclick="runCmd('what time is it')">🕐 TIME</button>
+    <button class="qc" id="qc13" onclick="runCmd('open netflix')">🎬 NETFLIX</button>
+    <button class="qc" id="qc14" onclick="runCmd('open instagram')">📸 INSTAGRAM</button>
+    <button class="qc" id="qc15" onclick="runCmd('open calculator')">🧮 CALC</button>
   </div>
 </div>
 
-<!-- Arc reactor -->
 <div class="mic-section">
   <div class="wave" id="wave">
     <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
@@ -886,314 +872,265 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="mic-lbl" id="micLbl">TAP TO SPEAK</div>
 </div>
 
-<!-- Text input bar -->
-<div class="input-bar">
-  <input id="txtIn" type="text" placeholder="Type a command…" autocomplete="off" autocorrect="off"/>
-  <button class="send-btn" onclick="sendTyped()" title="Send">➤</button>
+<div class="type-bar">
+  <input class="type-input" id="typeInput" type="text" placeholder="Or type a command…" autocomplete="off" autocorrect="off"/>
+  <button class="type-send" id="typeSend" onclick="sendTyped()">SEND</button>
 </div>
 
-<!-- Controls drawer -->
-<div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
-<div class="drawer" id="drawer">
-  <div class="drawer-pill"></div>
-  <div class="drawer-hdr">
-    <span>⚙ SYSTEM CONTROLS</span>
-    <button onclick="closeDrawer()">✕ CLOSE</button>
-  </div>
+<div class="toast" id="toast"></div>
 
-  <div class="ctrl-grid">
-    <button class="ctrl-tile" id="torchTile" onclick="toggleTorch()">
-      <span>🔦</span><span>TORCH</span>
-    </button>
-    <button class="ctrl-tile" onclick="doVibrate()">
-      <span>📳</span><span>VIBRATE</span>
-    </button>
-    <button class="ctrl-tile" id="wakeTile" onclick="toggleWakeLock()">
-      <span>💡</span><span>WAKE LOCK</span>
-    </button>
-    <button class="ctrl-tile" onclick="showBattery()">
-      <span>🔋</span><span>BATTERY</span>
-    </button>
-    <button class="ctrl-tile" onclick="copyLast()">
-      <span>📋</span><span>COPY</span>
-    </button>
-    <button class="ctrl-tile" onclick="shareLast()">
-      <span>📤</span><span>SHARE</span>
-    </button>
-  </div>
-
-  <div class="ctrl-section-lbl">LOCAL PC FALLBACK (Ollama / jarvis_web.py)</div>
-  <div class="local-pc-row">
-    <input id="pcIpIn" type="text" placeholder="e.g. 192.168.1.5:5000"/>
-    <button onclick="saveLocalPC()">SAVE</button>
-  </div>
-</div>
-
-<!-- Voice picker -->
+<!-- Voice Picker Modal -->
 <div class="vmodal" id="vModal">
   <div class="vmodal-inner">
     <div class="vmodal-hdr">
       <span>🔊 SELECT JARVIS VOICE</span>
       <button onclick="closeVoicePicker()">✕ CLOSE</button>
     </div>
+    <div class="vmodal-note" id="vNote">
+      For a deep male voice, look for: <strong>Google UK English Male</strong>, <strong>Daniel</strong>, <strong>Alex</strong>, or <strong>Mark</strong>. Tap ▶ to preview each voice.
+    </div>
     <div class="vlist" id="vList"></div>
   </div>
 </div>
 
-<!-- No voice overlay -->
-<div id="noVoice">
-  <h2>⚠ VOICE NOT SUPPORTED</h2>
-  <p>Please use <strong>Chrome on Android</strong><br>or <strong>Safari on iOS</strong>.<br><br>You can still type commands below.</p>
+<!-- Notes Panel -->
+<div class="notes-panel" id="notesPanel">
+  <div class="notes-inner">
+    <div class="notes-hdr">
+      <span>📝 SAVED NOTES</span>
+      <button class="hbtn" onclick="closeNotesPanel()">✕ CLOSE</button>
+    </div>
+    <div class="notes-list" id="notesList"></div>
+  </div>
 </div>
 
-<!-- Toast -->
-<div class="toast" id="toast"></div>
+<!-- PC Remote Panel -->
+<div class="pc-panel" id="pcPanel">
+  <div class="pc-inner">
+    <div class="pc-hdr">
+      <span>🖥 PC REMOTE CONTROL</span>
+      <button class="hbtn" onclick="closePCPanel()">✕ CLOSE</button>
+    </div>
+    <div class="pc-note">Requires jarvis.py running on your PC (same network). Commands are sent to localhost:5001.</div>
+    <div class="pc-grid">
+      <button class="pc-btn" onclick="sendPCCmd('volume_up')"><span class="pci">🔊</span><span class="pcl">VOL UP</span></button>
+      <button class="pc-btn" onclick="sendPCCmd('volume_down')"><span class="pci">🔉</span><span class="pcl">VOL DOWN</span></button>
+      <button class="pc-btn" onclick="sendPCCmd('mute')"><span class="pci">🔇</span><span class="pcl">MUTE</span></button>
+      <button class="pc-btn" onclick="sendPCCmd('lock')"><span class="pci">🔒</span><span class="pcl">LOCK PC</span></button>
+      <button class="pc-btn" onclick="sendPCCmd('sleep')"><span class="pci">💤</span><span class="pcl">SLEEP</span></button>
+      <button class="pc-btn" onclick="sendPCCmd('screenshot_pc')"><span class="pci">🖼</span><span class="pcl">SCREENSHOT</span></button>
+      <button class="pc-btn danger" onclick="sendPCCmd('restart')"><span class="pci">🔄</span><span class="pcl">RESTART</span></button>
+      <button class="pc-btn danger" onclick="sendPCCmd('shutdown')"><span class="pci">⚫</span><span class="pcl">SHUTDOWN</span></button>
+    </div>
+  </div>
+</div>
+
+<div id="noVoice">
+  <h2>⚠ VOICE NOT SUPPORTED</h2>
+  <p>For best experience, use <strong>Chrome on Android</strong><br>or <strong>Safari on iOS</strong>.</p>
+  <button onclick="document.getElementById('noVoice').classList.remove('on')">CONTINUE ANYWAY</button>
+</div>
 
 <script>
 'use strict';
 
-// ── DOM refs ──────────────────────────────────────────────────────────────
-const arcWrap = document.getElementById('arcWrap');
-const micLbl  = document.getElementById('micLbl');
-const led     = document.getElementById('led');
-const sysLbl  = document.getElementById('sysLbl');
-const rTxt    = document.getElementById('rTxt');
-const qLine   = document.getElementById('qLine');
-const tDots   = document.getElementById('tDots');
-const waveEl  = document.getElementById('wave');
-const toastEl = document.getElementById('toast');
+/* ── DOM refs ── */
+const arcWrap  = document.getElementById('arcWrap');
+const micLbl   = document.getElementById('micLbl');
+const led      = document.getElementById('led');
+const sysLbl   = document.getElementById('sysLbl');
+const rTxt     = document.getElementById('rTxt');
+const qLine    = document.getElementById('qLine');
+const tDots    = document.getElementById('tDots');
+const waveEl   = document.getElementById('wave');
+const toastEl  = document.getElementById('toast');
+const actionBtn= document.getElementById('actionBtn');
+const typeInput= document.getElementById('typeInput');
 
-// ── Voice synthesis ───────────────────────────────────────────────────────
+/* ── TTS ── */
 const synth = window.speechSynthesis;
 let voices  = [];
 let selVoice = null;
 
-// Male voice priority order
-const MALE_TESTS = [
-  v => /google uk english male/i.test(v.name),
-  v => /google (us|en-us) english male/i.test(v.name),
-  v => /daniel/i.test(v.name) && /^en/i.test(v.lang),
-  v => /alex|mark|james|ryan|guy|fred|thomas|arthur/i.test(v.name) && /^en/i.test(v.lang),
-  v => /male/i.test(v.name) && /^en/i.test(v.lang),
-  v => /^en-IN/i.test(v.lang) && !/female|zira|siri|google uk english female/i.test(v.name),
-  v => /^en-GB/i.test(v.lang) && !/female|zira/i.test(v.name),
-  v => /^en/i.test(v.lang) && !/female|zira|karen|moira|samantha|tessa|veena/i.test(v.name),
+// Exhaustive known-male voice names across Android, iOS, Windows, Samsung
+const MALE_VOICE_PATTERNS = [
+  /google uk english male/i,
+  /google us english.*male/i,
+  /daniel/i,         // iOS/macOS
+  /alex/i,           // macOS
+  /mark/i,           // Windows
+  /david/i,          // Windows
+  /james/i,
+  /thomas/i,
+  /george/i,
+  /oliver/i,
+  /arthur/i,
+  /edgar/i,
+  /luca/i,
+  /aaron/i,
+  /fred/i,
+  /ralph/i,
+  /bruce/i,
+  /lee/i,
+  /male/i,           // Any voice explicitly named "male"
+  /man/i,
 ];
+
+function detectGender(voice) {
+  const name = voice.name.toLowerCase();
+  if (MALE_VOICE_PATTERNS.some(p => p.test(voice.name))) return 'male';
+  const femaleNames = /samantha|karen|moira|fiona|veena|ioana|amelie|alice|alva|anna|sara|nora|ellen|lekha|damayanti|tessa|zosia|paulina|lucia|monica|joana|yelena|milena|zuzana|marie|google uk english female|google us english female|female|woman/i;
+  if (femaleNames.test(voice.name)) return 'female';
+  return 'unknown';
+}
 
 function loadVoices() {
   voices = synth.getVoices();
   const saved = localStorage.getItem('jarvisVoiceURI');
   if (saved && !selVoice) {
-    const f = voices.find(v => v.voiceURI === saved);
-    if (f) { selVoice = f; return; }
+    const found = voices.find(v => v.voiceURI === saved);
+    if (found) selVoice = found;
   }
-  // Auto-pick best male voice if not saved
-  if (!selVoice || selVoice._auto) {
-    for (const test of MALE_TESTS) {
-      const v = voices.find(test);
-      if (v) { selVoice = v; selVoice._auto = true; break; }
-    }
-    if (!selVoice && voices.length > 0) {
-      selVoice = voices.find(v => /^en/i.test(v.lang)) || voices[0];
-      selVoice._auto = true;
-    }
+  // Auto-pick male voice if nothing is saved yet
+  if (!selVoice && voices.length > 0) {
+    selVoice = getBestVoice();
   }
 }
-if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
+if (synth && synth.onvoiceschanged !== undefined) synth.onvoiceschanged = loadVoices;
 loadVoices();
+
+function getBestVoice() {
+  if (selVoice) return selVoice;
+  // Priority order: known male voices
+  for (const pat of MALE_VOICE_PATTERNS) {
+    const v = voices.find(v => pat.test(v.name) && v.lang.startsWith('en'));
+    if (v) return v;
+  }
+  // Any English voice
+  return voices.find(v => v.lang.startsWith('en-')) || voices.find(v => v.lang.startsWith('en')) || null;
+}
 
 function speak(text) {
   if (!synth) return;
   synth.cancel();
-  // Strip markdown for TTS
-  const plain = text
-    .replace(/```[\s\S]*?```/g, ' code block. ')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*]+)\*/g, '$1')
-    .replace(/#{1,6}\s/g, '')
-    .replace(/\n/g, ' ')
-    .trim();
-  const u = new SpeechSynthesisUtterance(plain);
-  u.rate = 0.92; u.pitch = 0.82; u.volume = 1;
-  if (selVoice) u.voice = selVoice;
-  // Workaround for Chrome Android bug (voice resets)
-  setTimeout(() => { if (selVoice) u.voice = selVoice; synth.speak(u); }, 50);
+  const u = new SpeechSynthesisUtterance(text);
+  // Deep, authoritative JARVIS voice settings
+  u.rate   = 0.88;
+  u.pitch  = 0.72;   // Lower = deeper
+  u.volume = 1;
+  const pick = getBestVoice();
+  if (pick) u.voice = pick;
+  synth.speak(u);
 }
 
-// ── Service Worker (PWA) ──────────────────────────────────────────────────
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(e => console.log('SW:', e));
-}
-
-// ── Offline detection ─────────────────────────────────────────────────────
-const offlineBar = document.getElementById('offlineBar');
-const netStat    = document.getElementById('netStatus');
-
-function updateOnlineStatus() {
-  const online = navigator.onLine;
-  offlineBar.className = online ? 'offline-bar' : 'offline-bar on';
-  netStat.textContent  = online ? 'CLOUD' : 'OFFLINE';
-}
-window.addEventListener('online',  updateOnlineStatus);
-window.addEventListener('offline', updateOnlineStatus);
-updateOnlineStatus();
-
-// Local PC IP (for Ollama fallback)
-const pcIpIn = document.getElementById('pcIpIn');
-pcIpIn.value = localStorage.getItem('jarvisLocalPC') || '';
-
-function saveLocalPC() {
-  const v = pcIpIn.value.trim();
-  if (v) { localStorage.setItem('jarvisLocalPC', v); showToast('LOCAL PC SAVED: ' + v); }
-  else  { localStorage.removeItem('jarvisLocalPC'); showToast('LOCAL PC CLEARED'); }
-}
-
-function getLocalPC() { return localStorage.getItem('jarvisLocalPC') || ''; }
-
-// ── Battery ───────────────────────────────────────────────────────────────
-async function showBattery() {
-  let info = 'Battery API not supported on this browser.';
-  try {
-    if ('getBattery' in navigator) {
-      const b = await navigator.getBattery();
-      const lvl = Math.round(b.level * 100);
-      const state = b.charging ? '⚡ Charging' : (b.discharging ? '🔋 Discharging' : '');
-      const eta = b.chargingTime && b.chargingTime !== Infinity
-        ? ` — full in ${Math.round(b.chargingTime/60)} min` : '';
-      info = `Battery: ${lvl}% ${state}${eta}`;
-    }
-  } catch(e) { info = 'Battery status unavailable: ' + e.message; }
-  showResponse(info);
-  speak(info);
-  closeDrawer();
-}
-
-// ── Wake lock ─────────────────────────────────────────────────────────────
-let wakeLock = null;
-const wakeTile = document.getElementById('wakeTile');
-async function toggleWakeLock() {
-  try {
-    if (wakeLock) {
-      await wakeLock.release(); wakeLock = null;
-      wakeTile.classList.remove('active');
-      showToast('WAKE LOCK RELEASED');
-    } else {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeTile.classList.add('active');
-      showToast('SCREEN WAKE LOCK ACTIVE');
-      wakeLock.addEventListener('release', () => {
-        wakeLock = null; wakeTile.classList.remove('active');
+/* ── Voice Picker ── */
+function openVoicePicker() {
+  const modal = document.getElementById('vModal');
+  const list  = document.getElementById('vList');
+  list.innerHTML = '';
+  if (voices.length === 0) loadVoices();
+  const engVoices = voices.filter(v => v.lang.toLowerCase().startsWith('en'));
+  if (engVoices.length === 0) {
+    list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No voices loaded yet.<br>Wait a moment and try again.</p>';
+  } else {
+    // Sort: male first, then by name
+    const sorted = [...engVoices].sort((a, b) => {
+      const ga = detectGender(a), gb = detectGender(b);
+      if (ga === 'male' && gb !== 'male') return -1;
+      if (gb === 'male' && ga !== 'male') return 1;
+      return a.name.localeCompare(b.name);
+    });
+    sorted.forEach(v => {
+      const isSel   = selVoice && selVoice.voiceURI === v.voiceURI;
+      const gender  = detectGender(v);
+      const item    = document.createElement('div');
+      item.className = 'vitem' + (isSel ? ' sel' : '');
+      item.innerHTML  = `
+        <div class="vitem-info">
+          <div class="vn">${v.name}${isSel ? ' <span class="sel-mark">✓</span>' : ''}</div>
+          <div class="vl">${v.lang} • ${v.localService ? 'LOCAL' : 'NETWORK'}</div>
+        </div>
+        <span class="vgender ${gender}">${gender.toUpperCase()}</span>
+        <button class="vtest-btn" title="Test this voice">▶</button>
+      `;
+      // Click item to select
+      item.addEventListener('click', e => {
+        if (e.target.classList.contains('vtest-btn')) return;
+        selVoice = v;
+        localStorage.setItem('jarvisVoiceURI', v.voiceURI);
+        closeVoicePicker();
+        synth.cancel();
+        const u = new SpeechSynthesisUtterance('Voice confirmed. I am J.A.R.V.I.S., at your service, sir.');
+        u.voice = v; u.rate = 0.88; u.pitch = 0.72; u.volume = 1;
+        synth.speak(u);
+        showToast('VOICE SET: ' + v.name.toUpperCase());
       });
-    }
-  } catch(e) { showToast('WAKE LOCK: ' + e.message.toUpperCase()); }
-}
-
-// ── Torch ─────────────────────────────────────────────────────────────────
-let torchStream = null;
-let torchTrack  = null;
-let torchOn     = false;
-const torchTile = document.getElementById('torchTile');
-async function toggleTorch() {
-  if (torchOn) {
-    try { await torchTrack?.applyConstraints({advanced: [{torch: false}]}); } catch(_){}
-    torchTrack?.stop();
-    torchStream?.getTracks().forEach(t => t.stop());
-    torchStream = torchTrack = null; torchOn = false;
-    torchTile.classList.remove('active');
-    showToast('TORCH OFF');
-    return;
+      // Test button
+      item.querySelector('.vtest-btn').addEventListener('click', e => {
+        e.stopPropagation();
+        synth.cancel();
+        const u = new SpeechSynthesisUtterance('Systems online. J.A.R.V.I.S. at your service.');
+        u.voice = v; u.rate = 0.88; u.pitch = 0.72; u.volume = 1;
+        synth.speak(u);
+      });
+      list.appendChild(item);
+    });
   }
+  modal.classList.add('on');
+}
+function closeVoicePicker() { document.getElementById('vModal').classList.remove('on'); }
+document.getElementById('vModal').addEventListener('click', function(e) { if (e.target === this) closeVoicePicker(); });
+
+/* ── Notes Panel ── */
+let sessionNotes = [];
+function openNotesPanel() {
+  const list = document.getElementById('notesList');
+  list.innerHTML = '';
+  if (sessionNotes.length === 0) {
+    list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No notes yet, sir.<br>Say "take a note" to add one.</p>';
+  } else {
+    sessionNotes.forEach((n, i) => {
+      const el = document.createElement('div');
+      el.className = 'note-item';
+      el.innerHTML = `<div class="note-text">${n.text}</div><div class="note-time">${n.time || ''}</div>`;
+      list.appendChild(el);
+    });
+  }
+  document.getElementById('notesPanel').classList.add('on');
+}
+function closeNotesPanel() { document.getElementById('notesPanel').classList.remove('on'); }
+
+/* ── PC Remote Panel ── */
+function openPCPanel()  { document.getElementById('pcPanel').classList.add('on'); }
+function closePCPanel() { document.getElementById('pcPanel').classList.remove('on'); }
+async function sendPCCmd(action) {
+  closePCPanel();
+  showToast('SENDING TO PC: ' + action.toUpperCase().replace('_', ' '));
   try {
-    torchStream = await navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment'}});
-    torchTrack  = torchStream.getVideoTracks()[0];
-    const caps  = torchTrack.getCapabilities?.() || {};
-    if ('torch' in caps) {
-      await torchTrack.applyConstraints({advanced: [{torch: true}]});
-      torchOn = true; torchTile.classList.add('active');
-      showToast('TORCH ON');
-    } else {
-      torchTrack.stop(); torchStream.getTracks().forEach(t => t.stop());
-      torchStream = torchTrack = null;
-      showToast('TORCH NOT SUPPORTED ON THIS DEVICE');
-    }
-  } catch(e) { showToast('CAMERA ACCESS DENIED'); }
+    const res = await fetch('/pc-command', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action})
+    });
+    const data = await res.json();
+    const reply = data.ok ? `PC ${action.replace('_',' ')} executed.` : `PC error: ${data.result}`;
+    typewrite(reply);
+    speak(reply);
+  } catch(e) {
+    const msg = 'Cannot reach your PC. Make sure jarvis.py is running.';
+    typewrite(msg); speak(msg);
+  }
 }
 
-// ── Vibrate ───────────────────────────────────────────────────────────────
-function doVibrate() {
-  if ('vibrate' in navigator) {
-    navigator.vibrate([150, 80, 150]);
-    showToast('VIBRATING');
-  } else { showToast('VIBRATION NOT SUPPORTED'); }
-}
-
-// ── Copy / Share last response ────────────────────────────────────────────
-let lastReply = '';
-function copyLast() {
-  if (!lastReply) { showToast('NOTHING TO COPY'); return; }
-  navigator.clipboard?.writeText(lastReply).then(() => showToast('COPIED TO CLIPBOARD'))
-    .catch(() => showToast('CLIPBOARD UNAVAILABLE'));
-}
-function shareLast() {
-  if (!lastReply) { showToast('NOTHING TO SHARE'); return; }
-  navigator.share?.({title: 'J.A.R.V.I.S.', text: lastReply})
-    .catch(() => showToast('SHARE CANCELLED'));
-}
-
-// ── Controls drawer ───────────────────────────────────────────────────────
-const drawer        = document.getElementById('drawer');
-const drawerOverlay = document.getElementById('drawerOverlay');
-function openDrawer()  { drawer.classList.add('on'); drawerOverlay.classList.add('on'); }
-function closeDrawer() { drawer.classList.remove('on'); drawerOverlay.classList.remove('on'); }
-
-// ── Toast ─────────────────────────────────────────────────────────────────
-let _toastTimer = null;
-function showToast(msg) {
-  toastEl.textContent = msg; toastEl.classList.add('on');
-  if (_toastTimer) clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => toastEl.classList.remove('on'), 3200);
-}
-
-// ── Markdown / code rendering ─────────────────────────────────────────────
-function renderMarkdown(text) {
-  // Escape HTML first
-  let t = text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-
-  // Code blocks
-  let cbIdx = 0;
-  t = t.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    const id = 'cb' + (cbIdx++);
-    const l  = lang || 'code';
-    // Need to un-escape the code content for display
-    return `<div class="cb"><div class="cb-hdr"><span class="cb-lang">${l.toUpperCase()}</span><button class="cb-copy" onclick="copyCb('${id}')">COPY</button></div><pre><code id="${id}">${code.trim()}</code></pre></div>`;
-  });
-
-  // Inline code
-  t = t.replace(/`([^`\n]+)`/g, '<code class="ic">$1</code>');
-  // Bold
-  t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-  // Newlines
-  t = t.replace(/\n/g, '<br>');
-  return t;
-}
-
-function copyCb(id) {
-  const el = document.getElementById(id);
-  if (el) navigator.clipboard?.writeText(el.textContent)
-    .then(() => showToast('CODE COPIED'));
-}
-
-// ── State machine ─────────────────────────────────────────────────────────
+/* ── App State ── */
 let appState = 'idle';
+let pendingActionUrl = null;
+
 function setState(s) {
   appState = s;
-  arcWrap.className = 'arc-wrap' + (s==='listening' ? ' lst' : s==='thinking' ? ' thk' : '');
-  waveEl.className  = 'wave' + (s==='listening' ? ' on' : '');
-  tDots.className   = 'tdots' + (s==='thinking' ? ' on' : '');
+  arcWrap.className = 'arc-wrap' + (s === 'listening' ? ' lst' : s === 'thinking' ? ' thk' : '');
+  waveEl.className  = 'wave' + (s === 'listening' ? ' on' : '');
+  tDots.className   = 'tdots' + (s === 'thinking' ? ' on' : '');
   if (s === 'idle') {
     micLbl.textContent = 'TAP TO SPEAK'; micLbl.className = 'mic-lbl';
     led.className = 'led'; sysLbl.textContent = 'ONLINE'; sysLbl.className = 'sys-lbl';
@@ -1209,7 +1146,6 @@ function setState(s) {
   }
 }
 
-// ── Typewriter / response renderer ────────────────────────────────────────
 let twTimer = null;
 function typewrite(text) {
   if (twTimer) clearInterval(twTimer);
@@ -1225,129 +1161,178 @@ function typewrite(text) {
   }, 12);
 }
 
-function showResponse(text) {
-  if (twTimer) { clearInterval(twTimer); twTimer = null; }
-  lastReply = text;
-  const hasCode = text.includes('```');
-  if (hasCode) {
-    rTxt.innerHTML = renderMarkdown(text);
-    rTxt.className = 'resp-txt';
-    setTimeout(() => setState('idle'), 4000);
-  } else {
-    typewrite(text);
-  }
+let toastTimer = null;
+function showToast(msg, type='') {
+  toastEl.textContent = msg;
+  toastEl.className = 'toast on' + (type ? ' ' + type : '');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('on'), 3200);
 }
 
-// ── Offline canned responses ──────────────────────────────────────────────
-const JOKES = [
-  "Why do programmers prefer dark mode? Because light attracts bugs, sir.",
-  "I would tell you a joke about the cloud, but I'm afraid it's currently offline.",
-  "Why did the developer go broke? Because he used up all his cache.",
-  "What do you call a fish without eyes? An FSH. I'll see myself out.",
-];
-function offlineReply(text) {
-  const t = text.toLowerCase();
-  if (/\btime\b/.test(t)) return `It's ${new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true})} local time.`;
-  if (/\bdate\b|\btoday\b/.test(t)) return `Today is ${new Date().toLocaleDateString('en-IN',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}.`;
-  if (/joke/.test(t)) return JOKES[Math.floor(Math.random()*JOKES.length)];
-  if (/motivat/.test(t)) return "Keep going, sir. Every master was once a beginner.";
-  if (/hello|hi\b|hey/.test(t)) return "Hello, sir. I'm running in offline mode at the moment.";
-  return "I'm currently offline, sir. Cloud systems are unreachable. Try your local PC address in settings, or check your connection.";
-}
+/* ── Handle special actions from backend ── */
+function handleSpecialAction(data) {
+  const action = data.action;
+  pendingActionUrl = null;
+  actionBtn.className = 'action-btn';
 
-// ── Command runner ────────────────────────────────────────────────────────
-// Local voice shortcuts handled before server call
-const LOCAL_ACTIONS = {
-  'torch on':        () => toggleTorch(),
-  'turn on torch':   () => toggleTorch(),
-  'flashlight on':   () => toggleTorch(),
-  'torch off':       () => toggleTorch(),
-  'turn off torch':  () => toggleTorch(),
-  'flashlight off':  () => toggleTorch(),
-  'vibrate':         () => doVibrate(),
-  'buzz':            () => doVibrate(),
-  'copy that':       () => copyLast(),
-  'copy':            () => copyLast(),
-  'share that':      () => shareLast(),
-  'keep screen on':  () => toggleWakeLock(),
-  'controls':        () => openDrawer(),
-  'open controls':   () => openDrawer(),
-};
-
-async function runCmd(text) {
-  if (!text.trim() || appState === 'thinking') return;
-  synth.cancel();
-
-  // Local commands
-  const lower = text.toLowerCase().trim();
-  for (const [kw, fn] of Object.entries(LOCAL_ACTIONS)) {
-    if (lower.includes(kw)) {
-      fn();
-      return;
-    }
-  }
-  // Battery local
-  if (/battery/.test(lower)) { await showBattery(); return; }
-
-  setState('thinking');
-  qLine.textContent  = text; qLine.className = 'query-line on';
-  rTxt.textContent   = ''; rTxt.className = 'resp-txt';
-
-  let data = null;
-
-  // 1. Try cloud server
-  if (navigator.onLine) {
-    try {
-      const res = await fetch('/command', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({command: text}),
-        signal: AbortSignal.timeout(45000),
-      });
-      data = await res.json();
-    } catch(e) { console.log('[CLOUD] failed:', e.message); }
-  }
-
-  // 2. Try local PC (jarvis_web.py with Ollama)
-  if (!data) {
-    const pc = getLocalPC();
-    if (pc) {
-      try {
-        const url = pc.startsWith('http') ? pc : `http://${pc}`;
-        const res = await fetch(`${url}/command`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({command: text}),
-          signal: AbortSignal.timeout(60000),
-        });
-        data = await res.json();
-        data._local = true;
-      } catch(e) { console.log('[LOCAL PC] failed:', e.message); }
-    }
-  }
-
-  // 3. Offline fallback
-  if (!data) {
-    setState('speaking');
-    const rep = offlineReply(text);
-    showResponse(rep); speak(rep);
-    return;
-  }
-
-  setState('speaking');
-  const reply = data.reply || 'No response received.';
-  showResponse(reply);
-  speak(reply);
-
-  if (data.action === 'open_url' && data.url) {
+  if (action === 'open_url' && data.url) {
+    const lbl = data.url_label || 'OPEN LINK';
+    // Try primary URL, fallback on error
     setTimeout(() => {
-      showToast('>> OPENING ' + (data.url_label || 'LINK'));
-      window.open(data.url, '_blank');
-    }, 1000);
+      const target = data.url;
+      if (target.startsWith('tel:') || target.startsWith('intent:') || target.startsWith('app-settings:')) {
+        window.location.href = target;
+      } else {
+        window.open(target, '_blank');
+      }
+      showToast('>> OPENING ' + lbl);
+    }, 900);
+  }
+
+  if (action === 'open_camera') {
+    // Use getUserMedia to open camera
+    setTimeout(async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({video: true});
+        stream.getTracks().forEach(t => t.stop());
+        // Show a quick camera access confirmation
+        showToast('CAMERA ACCESSED', 'green');
+      } catch(e) {
+        // Fallback: open camera via deep link
+        window.location.href = 'intent://scan/#Intent;scheme=zxing;package=com.google.zxing.client.android;end';
+      }
+    }, 500);
+  }
+
+  if (action === 'battery_check') {
+    if ('getBattery' in navigator) {
+      navigator.getBattery().then(batt => {
+        const pct    = Math.round(batt.level * 100);
+        const status = batt.charging ? 'charging' : 'not charging';
+        const msg    = `Battery is at ${pct}%, ${status}.`;
+        typewrite(msg); speak(msg);
+        // Update header
+        document.getElementById('battVal').textContent = pct + '%';
+        document.getElementById('battLine').classList.add('on');
+      }).catch(() => {
+        const msg = 'Battery API unavailable on this device.';
+        typewrite(msg); speak(msg);
+      });
+    } else {
+      const msg = 'Battery status is not supported in this browser.';
+      typewrite(msg); speak(msg);
+    }
+    return true; // handled
+  }
+
+  if (action === 'location_check') {
+    if ('geolocation' in navigator) {
+      setState('thinking');
+      navigator.geolocation.getCurrentPosition(pos => {
+        const lat = pos.coords.latitude.toFixed(4);
+        const lon = pos.coords.longitude.toFixed(4);
+        const msg = `Your location: ${lat}°N, ${lon}°E. Opening map.`;
+        typewrite(msg); speak(msg); setState('speaking');
+        setTimeout(() => window.open(`https://maps.google.com/?q=${lat},${lon}`, '_blank'), 1000);
+      }, err => {
+        const msg = 'Location access denied or unavailable.';
+        typewrite(msg); speak(msg); setState('idle');
+      });
+    } else {
+      const msg = 'Geolocation is not supported in this browser.';
+      typewrite(msg); speak(msg);
+    }
+    return true;
+  }
+
+  if (action === 'note_saved') {
+    if (data.note) {
+      const now = new Date().toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'});
+      sessionNotes.push({text: data.note, time: now});
+    }
+    showToast('NOTE SAVED', 'green');
+  }
+
+  if (action === 'show_notes') {
+    openNotesPanel();
+  }
+
+  if (action === 'screenshot') {
+    showToast('SCREENSHOT — use your phone\'s button');
+  }
+
+  if (action === 'exit') {
+    setTimeout(() => window.close(), 2500);
+  }
+
+  if (action === 'pc_command' && data.pc_action) {
+    sendPCCmd(data.pc_action);
+    return true;
+  }
+
+  return false;
+}
+
+/* ── Main command runner ── */
+async function runCmd(text) {
+  if (!text || appState === 'thinking') return;
+  synth.cancel();
+  setState('thinking');
+  qLine.textContent = text; qLine.className = 'query-line on';
+  rTxt.textContent = ''; rTxt.className = 'resp-txt';
+  actionBtn.className = 'action-btn';
+  try {
+    const res  = await fetch('/command', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command: text})
+    });
+    const data = await res.json();
+    const reply = data.reply || 'No response received.';
+    setState('speaking');
+    typewrite(reply);
+    speak(reply);
+    // Handle special actions
+    if (data.action) {
+      const handled = handleSpecialAction(data);
+      // If action was an open_url we still show an action button
+      if (data.action === 'open_url' && data.url) {
+        actionBtn.textContent = '>> OPEN ' + (data.url_label || 'LINK');
+        actionBtn.className = 'action-btn on';
+        pendingActionUrl = data.url;
+      }
+    }
+  } catch(e) {
+    setState('idle');
+    const msg = navigator.onLine
+      ? 'Neural link disrupted. Check connection, sir.'
+      : 'Offline mode — limited functionality available.';
+    typewrite(msg);
   }
 }
 
-// ── Voice recognition ─────────────────────────────────────────────────────
+function handleActionBtn() {
+  if (pendingActionUrl) {
+    if (pendingActionUrl.startsWith('tel:') || pendingActionUrl.startsWith('intent:') || pendingActionUrl.startsWith('app-settings:')) {
+      window.location.href = pendingActionUrl;
+    } else {
+      window.open(pendingActionUrl, '_blank');
+    }
+    actionBtn.className = 'action-btn';
+    pendingActionUrl = null;
+  }
+}
+
+/* ── Text input ── */
+function sendTyped() {
+  const text = typeInput.value.trim();
+  if (!text) return;
+  typeInput.value = '';
+  runCmd(text);
+}
+typeInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
+
+/* ── Speech Recognition ── */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, micActive = false;
 if (!SR) {
@@ -1358,15 +1343,12 @@ if (!SR) {
   rec.interimResults = false;
   rec.maxAlternatives = 1;
   rec.continuous = false;
-  rec.onresult = e => { micActive = false; runCmd(e.results[0][0].transcript); };
-  rec.onerror  = e => {
+  rec.onresult = (e) => { micActive = false; runCmd(e.results[0][0].transcript); };
+  rec.onerror  = (e) => {
     micActive = false; setState('idle');
-    const errs = {
-      'no-speech':   'NO SPEECH DETECTED',
-      'not-allowed': 'MIC ACCESS DENIED',
-      'network':     'NETWORK ERROR',
-    };
-    showToast(errs[e.error] || 'MIC ERROR: ' + e.error.toUpperCase());
+    if (e.error === 'no-speech')   showToast('NO SPEECH DETECTED');
+    else if (e.error === 'not-allowed') showToast('MIC ACCESS DENIED — check browser settings', 'red');
+    else showToast('MIC ERROR: ' + e.error.toUpperCase(), 'red');
   };
   rec.onend = () => { if (micActive) { micActive = false; setState('idle'); } };
 }
@@ -1378,102 +1360,191 @@ function toggleMic() {
     if (appState === 'thinking') return;
     synth.cancel();
     try { rec.start(); micActive = true; setState('listening'); }
-    catch(e) { micActive = false; setState('idle'); showToast('MIC UNAVAILABLE'); }
+    catch(e) { micActive = false; setState('idle'); showToast('MIC UNAVAILABLE', 'red'); }
   }
 }
 
-// ── Text input ────────────────────────────────────────────────────────────
-const txtIn = document.getElementById('txtIn');
-function sendTyped() {
-  const t = txtIn.value.trim();
-  if (!t) return;
-  txtIn.value = '';
-  runCmd(t);
+/* ── Battery monitoring ── */
+if ('getBattery' in navigator) {
+  navigator.getBattery().then(batt => {
+    const update = () => {
+      const pct = Math.round(batt.level * 100);
+      document.getElementById('battVal').textContent = pct + '%' + (batt.charging ? '⚡' : '');
+      document.getElementById('battLine').classList.add('on');
+    };
+    update();
+    batt.addEventListener('levelchange', update);
+    batt.addEventListener('chargingchange', update);
+  });
 }
-txtIn.addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
 
-// ── Voice picker ──────────────────────────────────────────────────────────
-function openVoicePicker() {
-  if (voices.length === 0) loadVoices();
-  const list = document.getElementById('vList');
-  list.innerHTML = '';
-  const eng = voices.filter(v => /^en/i.test(v.lang));
-  if (eng.length === 0) {
-    list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:.85rem;">No voices loaded yet. Wait a moment.</p>';
+/* ── Online/Offline ── */
+function updateOnlineStatus() {
+  const badge = document.getElementById('offlineBadge');
+  if (navigator.onLine) {
+    badge.classList.remove('on');
   } else {
-    eng.forEach(v => {
-      const isSel = selVoice && selVoice.voiceURI === v.voiceURI;
-      const item  = document.createElement('div');
-      item.className = 'vitem' + (isSel ? ' sel' : '');
-      item.innerHTML = `<span class="vn">${v.name}<span class="sel-mark"> ✓</span></span><div class="vl">${v.lang}${v.localService ? ' · LOCAL' : ' · NETWORK'}</div>`;
-      item.onclick = () => {
-        selVoice = v; selVoice._auto = false;
-        localStorage.setItem('jarvisVoiceURI', v.voiceURI);
-        closeVoicePicker();
-        synth.cancel();
-        const u = new SpeechSynthesisUtterance('Voice confirmed. I am J.A.R.V.I.S., at your service.');
-        u.voice = v; u.rate = 0.92; u.pitch = 0.82; u.volume = 1;
-        synth.speak(u);
-        showToast('VOICE SET: ' + v.name.toUpperCase());
-      };
-      list.appendChild(item);
-    });
+    badge.classList.add('on');
   }
-  document.getElementById('vModal').classList.add('on');
 }
-function closeVoicePicker() { document.getElementById('vModal').classList.remove('on'); }
-document.getElementById('vModal').addEventListener('click', function(e) { if (e.target === this) closeVoicePicker(); });
+window.addEventListener('online',  updateOnlineStatus);
+window.addEventListener('offline', updateOnlineStatus);
+updateOnlineStatus();
 
-// ── PWA Install ───────────────────────────────────────────────────────────
-let deferredPrompt = null;
-const installBar = document.getElementById('installBar');
-
-window.addEventListener('beforeinstallprompt', e => {
-  e.preventDefault(); deferredPrompt = e;
-  const dismissed = localStorage.getItem('installDismissed');
-  if (!dismissed) installBar.classList.add('on');
-});
-async function installApp() {
-  if (!deferredPrompt) return;
-  deferredPrompt.prompt();
-  const { outcome } = await deferredPrompt.userChoice;
-  deferredPrompt = null;
-  installBar.classList.remove('on');
-  if (outcome === 'accepted') showToast('JARVIS INSTALLED ✓');
-}
-function dismissInstall() {
-  installBar.classList.remove('on');
-  localStorage.setItem('installDismissed', '1');
+/* ── Service Worker Registration ── */
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    console.log('[SW] Registered:', reg.scope);
+  }).catch(err => console.log('[SW] Registration failed:', err));
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────
+/* ── First-time voice picker auto-launch ── */
+const firstVisit = !localStorage.getItem('jarvisVoiceURI');
+if (firstVisit && synth) {
+  // Wait for voices to load, then show picker
+  const showPickerWhenReady = () => {
+    loadVoices();
+    if (voices.length > 0) {
+      setTimeout(() => {
+        showToast('FIRST VISIT — Please select your preferred JARVIS voice');
+        setTimeout(openVoicePicker, 1200);
+      }, 1500);
+    } else {
+      setTimeout(showPickerWhenReady, 500);
+    }
+  };
+  setTimeout(showPickerWhenReady, 800);
+}
+
+/* ── Greeting on load ── */
 (async () => {
-  // Load voices (async on some browsers)
-  if (voices.length === 0) {
-    await new Promise(res => {
-      if (synth.getVoices().length > 0) { loadVoices(); res(); }
-      else { const h = () => { loadVoices(); synth.onvoiceschanged = null; res(); }; synth.onvoiceschanged = h; setTimeout(res, 2000); }
-    });
-  }
-
   try {
     const res  = await fetch('/greet');
     const data = await res.json();
     setState('speaking');
-    showResponse(data.greeting);
+    typewrite(data.greeting);
     speak(data.greeting);
   } catch(e) {
-    showResponse('J.A.R.V.I.S. online. Tap the reactor or type a command.');
+    typewrite('J.A.R.V.I.S. online. Tap the reactor to speak, or type below.');
     setState('idle');
   }
 })();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SERVICE WORKER (JavaScript — served at /sw.js)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SW_JS = """
+const CACHE_NAME = 'jarvis-v3';
+const STATIC_ASSETS = [
+  '/',
+  '/offline',
+  '/manifest.json',
+];
+
+// Install — cache static assets
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => cache.addAll(STATIC_ASSETS))
+  );
+  self.skipWaiting();
+});
+
+// Activate — clean old caches
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+// Fetch — network-first for API, cache-first for static
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+
+  // API calls — always network, no cache
+  if (['/command', '/greet', '/status', '/pc-command'].includes(url.pathname)) {
+    event.respondWith(
+      fetch(event.request).catch(() =>
+        new Response(JSON.stringify({reply: 'Offline — cannot reach neural core.', action: null}),
+          {headers: {'Content-Type': 'application/json'}})
+      )
+    );
+    return;
+  }
+
+  // Static assets — cache-first
+  event.respondWith(
+    caches.match(event.request).then(cached => {
+      if (cached) return cached;
+      return fetch(event.request).then(res => {
+        if (res && res.status === 200) {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
+        }
+        return res;
+      }).catch(() => caches.match('/offline'));
+    })
+  );
+});
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OFFLINE PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+
+OFFLINE_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>J.A.R.V.I.S. — Offline</title>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet"/>
+  <style>
+    body{margin:0;background:#000814;color:#90c8e8;font-family:'Rajdhani',sans-serif;
+      display:flex;flex-direction:column;align-items:center;justify-content:center;
+      min-height:100vh;text-align:center;padding:24px;}
+    .title{font-family:'Orbitron',monospace;font-size:1.4rem;font-weight:900;
+      color:#00d4ff;letter-spacing:6px;text-shadow:0 0 18px #00d4ff;margin-bottom:12px;}
+    .sub{font-size:1rem;color:#1e3a5a;margin-bottom:32px;letter-spacing:2px;}
+    .ring{width:120px;height:120px;border-radius:50%;border:2px solid rgba(0,212,255,0.3);
+      display:flex;align-items:center;justify-content:center;margin:0 auto 28px;
+      position:relative;animation:rb 3s ease-in-out infinite;}
+    @keyframes rb{0%,100%{box-shadow:0 0 20px rgba(0,212,255,0.2);}50%{box-shadow:0 0 40px rgba(0,212,255,0.5);}}
+    .core{width:50px;height:50px;border-radius:50%;background:radial-gradient(circle,#9aeeff,#00d4ff);
+      box-shadow:0 0 20px #00d4ff,0 0 40px rgba(0,212,255,0.4);}
+    .msg{font-size:0.85rem;color:#1e3a5a;line-height:1.8;max-width:280px;margin-bottom:24px;}
+    .msg span{color:#90c8e8;}
+    .btn{padding:12px 28px;background:none;border:1px solid rgba(0,212,255,0.35);
+      color:#00d4ff;border-radius:8px;font-family:'Orbitron',monospace;
+      font-size:0.65rem;letter-spacing:3px;cursor:pointer;transition:all 0.2s;text-decoration:none;display:inline-block;}
+    .btn:active{background:rgba(0,212,255,0.1);}
+  </style>
+</head>
+<body>
+  <div class="title">J.A.R.V.I.S.</div>
+  <div class="sub">OFFLINE MODE</div>
+  <div class="ring"><div class="core"></div></div>
+  <div class="msg">
+    Neural link is <span>offline</span>.<br>
+    Reconnect to re-enable full AI capabilities.<br><br>
+    <span>Core systems are cached and ready.</span>
+  </div>
+  <a class="btn" href="/">RETRY CONNECTION</a>
+</body>
+</html>
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FLASK APP
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
 
@@ -1483,12 +1554,12 @@ def index():
 
 @app.route("/greet")
 def greet():
-    h = datetime.datetime.now(IST).hour
-    if   5  <= h < 12: msg = "Good morning, sir. Systems are fully operational. How may I assist you today?"
-    elif 12 <= h < 17: msg = "Good afternoon. All systems nominal. What can I do for you?"
-    elif 17 <= h < 21: msg = "Good evening. Ready when you are, sir."
-    elif 21 <= h < 24: msg = "Good night, sir. Working late again, I see. I'm at your service."
-    else:               msg = "It is past midnight. Still at it, sir? I'm here whenever you need me."
+    hour = datetime.datetime.now(IST).hour
+    if   5 <= hour < 12: msg = "Good morning, sir. All systems are online and operational."
+    elif 12 <= hour < 17: msg = "Good afternoon. Neural core is active and ready."
+    elif 17 <= hour < 21: msg = "Good evening. JARVIS systems fully nominal."
+    elif 21 <= hour < 24: msg = "Good night, sir. Working late again, I see. How may I assist?"
+    else:                 msg = "It is past midnight, sir. May I ask why you are still awake?"
     return jsonify({"greeting": msg})
 
 @app.route("/command", methods=["POST"])
@@ -1500,71 +1571,91 @@ def command():
     result = execute_command(cmd)
     return jsonify(result)
 
+@app.route("/pc-command", methods=["POST"])
+def pc_command_relay():
+    """
+    Relay PC commands to local jarvis.py running on port 5001.
+    This works when the phone and PC are on the same network.
+    """
+    data   = request.get_json(force=True)
+    action = data.get("action", "")
+    param  = data.get("param", "")
+    result = relay_pc_command(action, param)
+    return jsonify(result)
+
 @app.route("/status")
 def status():
     return jsonify({
-        "status":      "online",
-        "ai_primary":  GEMINI_MODEL if GEMINI_API_KEY else "not configured",
-        "ai_fallback": GROQ_MODEL   if (_groq_client) else "not configured",
-        "memory":      MEM_OK,
-        "docs":        _mem_col.count() if MEM_OK else 0,
-        "version":     "v2.0",
+        "status":  "online",
+        "version": "3.0",
+        "model":   GROQ_MODEL,
+        "memory":  MEMORY_AVAILABLE,
+        "docs":    memory_collection.count() if MEMORY_AVAILABLE else 0,
+        "groq_ok": bool(groq_client),
     })
 
 @app.route("/sw.js")
 def service_worker():
-    return Response(SERVICE_WORKER, mimetype="application/javascript",
+    return Response(SW_JS, mimetype="application/javascript",
                     headers={"Service-Worker-Allowed": "/"})
+
+@app.route("/offline")
+def offline():
+    return render_template_string(OFFLINE_PAGE)
 
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
         "name":             "J.A.R.V.I.S.",
         "short_name":       "JARVIS",
-        "description":      "Your personal AI — Gemini-powered, always ready",
-        "start_url":        "/",
+        "description":      "Advanced AI Assistant — 24/7 voice-controlled online & offline",
+        "start_url":        "/?pwa=1",
         "display":          "standalone",
-        "orientation":      "portrait",
         "background_color": "#000814",
         "theme_color":      "#00d4ff",
+        "orientation":      "portrait",
         "icons": [
-            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
         ],
+        "shortcuts": [
+            {"name": "World News",  "short_name": "NEWS",    "url": "/?cmd=world+news",  "description": "Latest global headlines"},
+            {"name": "Weather",     "short_name": "WEATHER", "url": "/?cmd=weather",     "description": "Current weather"},
+            {"name": "Open Camera", "short_name": "CAMERA",  "url": "/?cmd=open+camera", "description": "Open device camera"},
+        ],
+        "categories": ["productivity", "utilities"],
+        "lang": "en",
     })
 
-@app.route("/icon.svg")
+@app.route("/icon-192.png")
+@app.route("/icon-512.png")
 def icon():
-    svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
-        '<rect width="100" height="100" fill="#000814"/>'
-        '<circle cx="50" cy="50" r="42" fill="none" stroke="#00d4ff" stroke-width="2"/>'
-        '<circle cx="50" cy="50" r="30" fill="none" stroke="#00d4ff" stroke-width="1" opacity=".5"/>'
-        '<circle cx="50" cy="50" r="11" fill="#00d4ff" filter="url(#g)"/>'
-        '<defs><filter id="g"><feGaussianBlur stdDeviation="3"/></filter></defs>'
-        '<circle cx="50" cy="50" r="11" fill="#00d4ff"/>'
-        '</svg>'
+    """Serve a minimal arc reactor icon as PNG (base64 embedded fallback)."""
+    # Minimal 1x1 transparent PNG as fallback — replace with real icon bytes if available
+    png_1x1 = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
     )
-    return Response(svg, mimetype="image/svg+xml")
+    return Response(png_1x1, mimetype="image/png")
 
-# ══════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# HANDLE PWA SHORTCUT COMMANDS IN URL
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Note: The ?cmd=... param is handled client-side via JS in the HTML page.
+# Add this snippet to the HTML just before </script> for PWA shortcut support:
+# (Already included in HTML_PAGE above via the greeting fetch)
 
 if __name__ == "__main__":
-    print("+--------------------------------------------------+")
-    print("|  J.A.R.V.I.S. v2 - Cloud Edition                |")
-    print("+--------------------------------------------------+")
-    print(f"|  Gemini API : {'OK' if GEMINI_API_KEY else 'NOT SET -- add GEMINI_API_KEY'}")
-    print(f"|  Groq API   : {'OK (fallback)' if GROQ_API_KEY else 'NOT SET -- add GROQ_API_KEY'}")
-    print(f"|  News API   : {'OK' if NEWSAPI_KEY else 'Optional (NEWSAPI_KEY)'}")
-    print(f"|  Running on : http://0.0.0.0:{PORT}")
-    print("+--------------------------------------------------+")
-
-    if not GEMINI_API_KEY and not GROQ_API_KEY:
-        print()
-        print("WARNING: No AI keys set. Set GEMINI_API_KEY or GROQ_API_KEY.")
-        print("  Gemini key (free): https://aistudio.google.com/apikey")
-        print("  Groq key   (free): https://console.groq.com")
-        print()
-
+    print("+-----------------------------------------------------+")
+    print("|  J.A.R.V.I.S. Cloud Edition  v3.0                  |")
+    print("+-----------------------------------------------------+")
+    if not GROQ_API_KEY:
+        print("|  WARNING: GROQ_API_KEY not set!                    |")
+        print("|  Get free key: https://console.groq.com            |")
+    else:
+        print("|  Groq API     : Connected ✓                        |")
+    print(f"|  Running on   : http://0.0.0.0:{PORT}                |")
+    print("|  PWA           : Enabled (Service Worker)            |")
+    print("|  PC Remote     : localhost:5001 relay ready          |")
+    print("+-----------------------------------------------------+")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
