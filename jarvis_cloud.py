@@ -1160,6 +1160,7 @@ function typewrite(text) {
     if (i < text.length) { rTxt.textContent += text[i++]; }
     else {
       rTxt.className = 'resp-txt';
+      t
       clearInterval(twTimer); twTimer = null;
       setTimeout(() => setState('idle'), 2500);
     }
@@ -1829,8 +1830,10 @@ function copyBlock(id) {
 }
 
 /* ── Override typewrite to support code blocks ── */
+let typewriteActive = false;
 const _origTypewrite = typewrite;
 function typewrite(text) {
+  typewriteActive = true;
   if (twTimer) clearInterval(twTimer);
   const codeHtml = renderCodeBlocks(text);
   if (codeHtml) {
