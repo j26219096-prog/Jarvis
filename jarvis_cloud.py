@@ -2075,7 +2075,10 @@ def icon():
 # ══════════════════════════════════════════════════════════════════════════════
 
 import subprocess
-import resource as _resource_mod  # Unix only; gracefully skipped on Windows
+try:
+    import resource as _resource_mod  # Unix only; gracefully skipped on Windows
+except ImportError:
+    _resource_mod = None
 import signal
 import tempfile
 import shutil
