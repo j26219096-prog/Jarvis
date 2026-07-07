@@ -1,18 +1,23 @@
 """
 J.A.R.V.I.S. Cloud Edition — Advanced
 =======================================
-v3.0 — Now with:
+v4.0 — Now with:
   • Smart voice selection (male-first, deep pitch) — fixes mobile female-only bug
   • Advanced mobile controls: camera, dialer, alarm, translate, battery, location, notes
-  • PC Remote Control: phone → PC via local REST (jarvis.py must run on PC)
+  • PC Remote Control: phone -> PC via local REST (jarvis.py must run on PC)
   • Full PWA: installable as offline app, Service Worker cache, app shortcuts
-  • Offline fallback page
+  • CODE EXECUTION ENGINE: write + run Python, JS, HTML, Bash from your phone!
+    - Syntax highlighted code blocks with COPY + RUN buttons
+    - Python executed server-side in sandboxed subprocess (10s timeout)
+    - JavaScript run in browser sandbox
+    - HTML/CSS live preview in iframe
+    - Output terminal with stdout/stderr/runtime display
 
 Deploy to Render.com (free):
   1. Push this folder to GitHub
-  2. Connect repo → New Web Service
+  2. Connect repo -> New Web Service
   3. Add env vars: GROQ_API_KEY, NEWSAPI_KEY (optional)
-  4. Deploy — get your permanent HTTPS URL
+  4. Deploy -- get your permanent HTTPS URL
   5. Add to Home Screen on phone = native app experience
 
 Local test:
@@ -62,7 +67,7 @@ except ImportError:
     groq_client = None
 
 BASE_SYSTEM_PROMPT = (
-    "You are J.A.R.V.I.S., an advanced, witty, and highly capable AI assistant created for Jawahar. "
+    "You are J.A.R.V.I.S., an advanced, witty, and highly capable AI assistant and expert software engineer created for Jawahar. "
     "You speak in a calm, professional, slightly British tone with occasional dry humour, "
     "inspired by Tony Stark's Friday. "
     "Keep responses concise (1-3 sentences unless asked for more). "
@@ -1429,10 +1434,405 @@ if (firstVisit && synth) {
     setState('idle');
   }
 })();
+/* ════════════════════════════════════════════════
+   CODE EXECUTION ENGINE — IDE Panel
+   ════════════════════════════════════════════════ */
+
+/* Inject highlight.js for syntax highlighting */
+(function() {
+  const hlLink = document.createElement('link');
+  hlLink.rel  = 'stylesheet';
+  hlLink.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css';
+  document.head.appendChild(hlLink);
+
+  const hlScript = document.createElement('script');
+  hlScript.src = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js';
+  hlScript.onload = () => {
+    if (window.hljs) window.hljs.configure({tabReplace: '  '});
+  };
+  document.head.appendChild(hlScript);
+})();
+
+/* ── Inject IDE panel styles ── */
+(function() {
+  const s = document.createElement('style');
+  s.textContent = `
+  /* ── CODE IDE PANEL ── */
+  .code-panel {
+    display:none;position:fixed;inset:0;z-index:450;
+    background:rgba(0,0,0,0.92);
+    flex-direction:column;
+  }
+  .code-panel.on { display:flex; }
+  .ide-hdr {
+    display:flex;align-items:center;gap:10px;
+    background:#0d1117;padding:10px 14px;flex-shrink:0;
+    border-bottom:1px solid rgba(0,212,255,0.15);
+  }
+  .ide-lang {
+    font-family:'Orbitron',monospace;font-size:0.62rem;
+    letter-spacing:3px;color:#00d4ff;flex:1;
+  }
+  .ide-close {
+    background:none;border:1px solid #1e3a5a;color:#90c8e8;
+    border-radius:5px;padding:4px 10px;cursor:pointer;
+    font-family:'Share Tech Mono',monospace;font-size:0.7rem;
+  }
+  .ide-close:active { border-color:#ff2255;color:#ff2255; }
+  .ide-tabs {
+    display:flex;gap:0;background:#0d1117;flex-shrink:0;
+    border-bottom:1px solid rgba(0,212,255,0.1);
+  }
+  .ide-tab {
+    padding:7px 16px;font-family:'Orbitron',monospace;
+    font-size:0.55rem;letter-spacing:2px;color:#1e3a5a;
+    cursor:pointer;border-bottom:2px solid transparent;
+    transition:all 0.15s;
+  }
+  .ide-tab.active { color:#00d4ff;border-bottom-color:#00d4ff; }
+  .ide-body { flex:1;overflow:hidden;display:flex;flex-direction:column; }
+  .ide-code-wrap {
+    flex:1;overflow:auto;background:#0d1117;
+    position:relative;
+  }
+  .ide-code-wrap pre {
+    margin:0;padding:16px;
+    font-size:0.82rem;line-height:1.6;
+    font-family:'Share Tech Mono',monospace;
+  }
+  .ide-code-wrap code { font-family:'Share Tech Mono',monospace !important; }
+  .ide-actions {
+    display:flex;gap:8px;padding:10px 14px;
+    background:#0d1117;flex-shrink:0;
+    border-top:1px solid rgba(0,212,255,0.08);
+  }
+  .ide-run-btn {
+    flex:1;padding:11px;border-radius:8px;
+    background:rgba(0,212,255,0.1);
+    border:1px solid rgba(0,212,255,0.4);
+    color:#00d4ff;font-family:'Orbitron',monospace;
+    font-size:0.62rem;letter-spacing:2px;cursor:pointer;
+    transition:all 0.15s;
+  }
+  .ide-run-btn:active { background:rgba(0,212,255,0.22); }
+  .ide-run-btn.running { border-color:#ffaa00;color:#ffaa00;animation:pulse 0.8s infinite; }
+  .ide-copy-btn {
+    padding:11px 16px;border-radius:8px;
+    background:rgba(0,255,136,0.07);
+    border:1px solid rgba(0,255,136,0.3);
+    color:#00ff88;font-family:'Orbitron',monospace;
+    font-size:0.62rem;letter-spacing:1px;cursor:pointer;
+    transition:all 0.15s;
+  }
+  .ide-copy-btn:active { background:rgba(0,255,136,0.18); }
+  @keyframes pulse { 0%,100%{opacity:1;}50%{opacity:0.5;} }
+
+  /* ── Terminal Output ── */
+  .ide-output {
+    max-height:45vh;overflow-y:auto;
+    background:#0a0f0a;
+    border-top:1px solid rgba(0,255,136,0.12);
+    font-family:'Share Tech Mono',monospace;font-size:0.78rem;
+    padding:12px 14px;display:none;flex-direction:column;gap:4px;
+  }
+  .ide-output.on { display:flex; }
+  .out-hdr {
+    display:flex;justify-content:space-between;align-items:center;
+    margin-bottom:6px;
+  }
+  .out-lbl { color:rgba(0,255,136,0.6);font-size:0.6rem;letter-spacing:2px; }
+  .out-meta { color:#1e3a5a;font-size:0.6rem; }
+  .out-stdout { color:#00ff88;white-space:pre-wrap;word-break:break-all; }
+  .out-stderr { color:#ff2255;white-space:pre-wrap;word-break:break-all;margin-top:6px; }
+  .out-empty  { color:#1e3a5a;font-style:italic; }
+
+  /* ── HTML/JS Preview iframe ── */
+  .ide-preview {
+    flex:1;border:none;background:#fff;display:none;
+  }
+  .ide-preview.on { display:block; }
+
+  /* ── Code blocks inside .resp-txt ── */
+  .jarvis-code-block {
+    margin:10px 0;border-radius:10px;overflow:hidden;
+    border:1px solid rgba(0,212,255,0.15);
+    background:#0d1117;
+  }
+  .jcb-header {
+    display:flex;align-items:center;justify-content:space-between;
+    padding:6px 12px;background:#161b22;
+    border-bottom:1px solid rgba(0,212,255,0.08);
+  }
+  .jcb-lang {
+    font-family:'Orbitron',monospace;font-size:0.52rem;
+    letter-spacing:3px;color:#00d4ff;
+  }
+  .jcb-btns { display:flex;gap:6px; }
+  .jcb-btn {
+    padding:3px 9px;border-radius:4px;
+    font-family:'Share Tech Mono',monospace;font-size:0.65rem;
+    cursor:pointer;border:1px solid;transition:all 0.15s;
+    background:none;
+  }
+  .jcb-copy { color:#00ff88;border-color:rgba(0,255,136,0.3); }
+  .jcb-copy:active { background:rgba(0,255,136,0.12); }
+  .jcb-run  { color:#00d4ff;border-color:rgba(0,212,255,0.35); }
+  .jcb-run:active  { background:rgba(0,212,255,0.12); }
+  .jcb-code { padding:12px;overflow-x:auto;max-height:260px;overflow-y:auto; }
+  .jcb-code pre { margin:0; }
+  .jcb-code code {
+    font-family:'Share Tech Mono',monospace !important;
+    font-size:0.78rem !important;line-height:1.55;
+  }
+  `;
+  document.head.appendChild(s);
+})();
+
+/* ── Inject IDE panel HTML ── */
+(function() {
+  const panel = document.createElement('div');
+  panel.className = 'code-panel';
+  panel.id = 'codePanel';
+  panel.innerHTML = `
+    <div class="ide-hdr">
+      <div class="ide-lang" id="ideLang">PYTHON</div>
+      <button class="ide-close" onclick="closeIDE()">X CLOSE</button>
+    </div>
+    <div class="ide-tabs">
+      <div class="ide-tab active" id="tabCode"  onclick="switchIDETab('code')">CODE</div>
+      <div class="ide-tab"        id="tabOutput" onclick="switchIDETab('output')">OUTPUT</div>
+      <div class="ide-tab"        id="tabPreview" onclick="switchIDETab('preview')" style="display:none">PREVIEW</div>
+    </div>
+    <div class="ide-body">
+      <div class="ide-code-wrap" id="ideCodeWrap">
+        <pre><code id="ideCode" class="hljs"></code></pre>
+      </div>
+      <div class="ide-output" id="ideOutput">
+        <div class="out-hdr">
+          <span class="out-lbl">TERMINAL OUTPUT</span>
+          <span class="out-meta" id="outMeta"></span>
+        </div>
+        <div class="out-stdout" id="outStdout"></div>
+        <div class="out-stderr" id="outStderr"></div>
+      </div>
+      <iframe class="ide-preview" id="idePreview" sandbox="allow-scripts allow-same-origin"></iframe>
+    </div>
+    <div class="ide-actions">
+      <button class="ide-run-btn" id="ideRunBtn" onclick="runIDECode()">&#9654; RUN CODE</button>
+      <button class="ide-copy-btn" id="ideCopyBtn" onclick="copyIDECode()">COPY</button>
+    </div>
+  `;
+  document.body.appendChild(panel);
+})();
+
+/* ── IDE State ── */
+let ideCode = '', ideLang = 'python', ideTab = 'code';
+
+function openIDE(code, lang) {
+  ideCode = code;
+  ideLang = (lang || 'python').toLowerCase();
+  document.getElementById('ideLang').textContent = ideLang.toUpperCase();
+  const codeEl = document.getElementById('ideCode');
+  codeEl.textContent = code;
+  codeEl.className = 'hljs language-' + ideLang;
+  if (window.hljs) window.hljs.highlightElement(codeEl);
+
+  // Show/hide Preview tab
+  const previewTab = document.getElementById('tabPreview');
+  if (['html', 'htm', 'css', 'javascript', 'js'].includes(ideLang)) {
+    previewTab.style.display = 'block';
+  } else {
+    previewTab.style.display = 'none';
+  }
+
+  // Reset output
+  document.getElementById('ideOutput').classList.remove('on');
+  document.getElementById('idePreview').classList.remove('on');
+  document.getElementById('ideCodeWrap').style.display = 'block';
+  switchIDETab('code');
+  document.getElementById('codePanel').classList.add('on');
+}
+
+function closeIDE() {
+  document.getElementById('codePanel').classList.remove('on');
+  document.getElementById('idePreview').src = 'about:blank';
+}
+
+function switchIDETab(tab) {
+  ideTab = tab;
+  document.getElementById('tabCode').classList.toggle('active',   tab === 'code');
+  document.getElementById('tabOutput').classList.toggle('active', tab === 'output');
+  document.getElementById('tabPreview').classList.toggle('active',tab === 'preview');
+
+  document.getElementById('ideCodeWrap').style.display = tab === 'code' ? 'block' : 'none';
+  const outEl = document.getElementById('ideOutput');
+  outEl.classList.toggle('on', tab === 'output');
+  const prevEl = document.getElementById('idePreview');
+  prevEl.classList.toggle('on', tab === 'preview');
+}
+
+function copyIDECode() {
+  navigator.clipboard.writeText(ideCode).then(() => {
+    showToast('CODE COPIED', 'green');
+    const btn = document.getElementById('ideCopyBtn');
+    btn.textContent = 'COPIED!';
+    setTimeout(() => btn.textContent = 'COPY', 1500);
+  }).catch(() => {
+    showToast('COPY FAILED', 'red');
+  });
+}
+
+async function runIDECode() {
+  const lang   = ideLang;
+  const code   = ideCode;
+  const runBtn = document.getElementById('ideRunBtn');
+  runBtn.textContent = 'RUNNING...';
+  runBtn.classList.add('running');
+
+  // ── HTML/CSS: live preview in iframe ──
+  if (['html', 'htm'].includes(lang)) {
+    document.getElementById('idePreview').srcdoc = code;
+    switchIDETab('preview');
+    runBtn.textContent = '\u25B6 RUN CODE';
+    runBtn.classList.remove('running');
+    return;
+  }
+
+  // ── JavaScript: run in sandboxed iframe ──
+  if (['js', 'javascript'].includes(lang)) {
+    const html = `<!DOCTYPE html><html><body><script>
+    const _log = [], _err = [];
+    const _origLog = console.log, _origErr = console.error;
+    console.log = (...a) => { _log.push(a.map(String).join(' ')); _origLog(...a); };
+    console.error = (...a) => { _err.push(a.map(String).join(' ')); _origErr(...a); };
+    window.onerror = (msg,src,l,c,e) => { _err.push(e?e.toString():msg); };
+    try {
+      ${code}
+    } catch(e) { _err.push(e.toString()); }
+    parent.postMessage({stdout: _log.join('\\n'), stderr: _err.join('\\n'), runtime_ms: 0, exit_code: _err.length?1:0}, '*');
+    <\/script></body></html>`;
+
+    window.addEventListener('message', function handleMsg(e) {
+      window.removeEventListener('message', handleMsg);
+      showOutput(e.data);
+      runBtn.textContent = '\u25B6 RUN CODE'; runBtn.classList.remove('running');
+    });
+
+    document.getElementById('idePreview').srcdoc = html;
+    switchIDETab('output');
+    return;
+  }
+
+  // ── Python / Bash: send to server ──
+  try {
+    const res  = await fetch('/run-code', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({language: lang, code: code})
+    });
+    const data = await res.json();
+    showOutput(data);
+    switchIDETab('output');
+  } catch(e) {
+    showOutput({stdout:'', stderr:'Cannot reach execution server.', exit_code:1, runtime_ms:0});
+    switchIDETab('output');
+  }
+  runBtn.textContent = '\u25B6 RUN CODE';
+  runBtn.classList.remove('running');
+}
+
+function showOutput(data) {
+  const outEl     = document.getElementById('ideOutput');
+  const stdoutEl  = document.getElementById('outStdout');
+  const stderrEl  = document.getElementById('outStderr');
+  const metaEl    = document.getElementById('outMeta');
+
+  const status = data.exit_code === 0 ? 'OK' : 'ERROR';
+  metaEl.textContent  = `EXIT ${data.exit_code} | ${data.runtime_ms}ms | ${status}`;
+  stdoutEl.textContent = data.stdout || '';
+  stderrEl.textContent = data.stderr || '';
+  if (!data.stdout && !data.stderr) {
+    stdoutEl.innerHTML = '<span class="out-empty">No output produced.</span>';
+  }
+  outEl.classList.add('on');
+}
+
+/* ── Parse LLM response for code blocks and render IDE-style ── */
+function renderCodeBlocks(text) {
+  // Match ```lang\ncode\n``` patterns
+  const codeBlockRe = /```(\w*)\n?([\s\S]*?)```/g;
+  let match, lastIndex = 0, html = '';
+  let hasCode = false;
+
+  while ((match = codeBlockRe.exec(text)) !== null) {
+    hasCode = true;
+    const before = text.slice(lastIndex, match.index);
+    if (before) html += escapeHtml(before).replace(/\n/g, '<br>');
+    const lang = match[1] || 'plaintext';
+    const code = match[2].trimEnd();
+    const escapedCode = escapeHtml(code);
+    const blockId = 'cb_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+    html += `
+      <div class="jarvis-code-block">
+        <div class="jcb-header">
+          <span class="jcb-lang">${lang.toUpperCase()}</span>
+          <div class="jcb-btns">
+            <button class="jcb-btn jcb-copy" onclick="copyBlock('${blockId}')">COPY</button>
+            <button class="jcb-btn jcb-run"  onclick="openIDE(getBlock('${blockId}'),'${lang}')">RUN</button>
+          </div>
+        </div>
+        <div class="jcb-code" id="${blockId}">
+          <pre><code class="language-${lang}">${escapedCode}</code></pre>
+        </div>
+      </div>`;
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (!hasCode) return null; // No code blocks — plain text
+
+  const after = text.slice(lastIndex);
+  if (after.trim()) html += '<div style="margin-top:8px">' + escapeHtml(after).replace(/\n/g,'<br>') + '</div>';
+  return html;
+}
+
+function escapeHtml(t) {
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function getBlock(id) {
+  const el = document.getElementById(id);
+  return el ? el.querySelector('code').textContent : '';
+}
+
+function copyBlock(id) {
+  const code = getBlock(id);
+  navigator.clipboard.writeText(code).then(() => showToast('CODE COPIED', 'green'));
+}
+
+/* ── Override typewrite to support code blocks ── */
+const _origTypewrite = typewrite;
+function typewrite(text) {
+  if (twTimer) clearInterval(twTimer);
+  const codeHtml = renderCodeBlocks(text);
+  if (codeHtml) {
+    // Render immediately with syntax highlighting
+    rTxt.className = 'resp-txt';
+    rTxt.innerHTML = codeHtml;
+    // Apply highlight.js to all code blocks
+    if (window.hljs) {
+      rTxt.querySelectorAll('pre code').forEach(el => window.hljs.highlightElement(el));
+    }
+    actionBtn.className = 'action-btn';
+    setTimeout(() => setState('idle'), 1000);
+  } else {
+    _origTypewrite(text);
+  }
+}
 </script>
 </body>
 </html>
 """
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SERVICE WORKER (JavaScript — served at /sw.js)
@@ -1638,24 +2038,137 @@ def icon():
     return Response(png_1x1, mimetype="image/png")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HANDLE PWA SHORTCUT COMMANDS IN URL
+# CODE EXECUTION ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Note: The ?cmd=... param is handled client-side via JS in the HTML page.
-# Add this snippet to the HTML just before </script> for PWA shortcut support:
-# (Already included in HTML_PAGE above via the greeting fetch)
+import subprocess
+import resource as _resource_mod  # Unix only; gracefully skipped on Windows
+import signal
+import tempfile
+import shutil
+
+# Languages supported server-side
+SERVER_LANGS = {"python", "python3", "py", "bash", "sh", "shell"}
+# Languages run client-side (JS, HTML) — handled in frontend
+
+# Dangerous patterns blocked in user Python code
+DANGEROUS_PATTERNS = [
+    "import os",  "os.system", "os.popen", "subprocess",
+    "shutil.rmtree", "open('/", 'open("/',
+    "__import__", "eval(", "exec(",
+    "socket", "urllib", "http", "requests",
+    "sys.exit", "exit()", "quit()",
+]
+
+def run_code_safely(language: str, code: str) -> dict:
+    """
+    Execute code in a sandboxed subprocess.
+    Returns: {stdout, stderr, exit_code, runtime_ms, blocked}
+    """
+    lang = language.lower().strip()
+
+    # ── Security: block dangerous patterns in Python ──
+    if lang in ("python", "python3", "py"):
+        code_lower = code.lower()
+        for pattern in DANGEROUS_PATTERNS:
+            if pattern.lower() in code_lower:
+                return {
+                    "stdout": "",
+                    "stderr": f"[JARVIS SECURITY] Blocked pattern detected: '{pattern}'. "
+                              "Dangerous operations are not permitted in the sandbox.",
+                    "exit_code": 1,
+                    "runtime_ms": 0,
+                    "blocked": True,
+                }
+
+    # ── Map language to command ──
+    if lang in ("python", "python3", "py"):
+        cmd = [sys.executable, "-c", code]
+    elif lang in ("bash", "sh", "shell"):
+        cmd = ["bash", "-c", code]
+    else:
+        return {
+            "stdout": "",
+            "stderr": f"Server-side execution not supported for '{language}'. "
+                      "JavaScript and HTML run in your browser.",
+            "exit_code": 1,
+            "runtime_ms": 0,
+            "blocked": False,
+        }
+
+    # ── Execute with timeout ──
+    start = time.time()
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,           # Hard 10-second limit
+            cwd=tempfile.gettempdir(),
+        )
+        runtime_ms = int((time.time() - start) * 1000)
+        stdout = result.stdout[:50_000]   # Cap at 50 KB
+        stderr = result.stderr[:10_000]
+        return {
+            "stdout":     stdout,
+            "stderr":     stderr,
+            "exit_code":  result.returncode,
+            "runtime_ms": runtime_ms,
+            "blocked":    False,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "stdout":     "",
+            "stderr":     "[TIMEOUT] Code exceeded the 10-second execution limit.",
+            "exit_code":  124,
+            "runtime_ms": 10000,
+            "blocked":    False,
+        }
+    except FileNotFoundError:
+        return {
+            "stdout":     "",
+            "stderr":     f"Interpreter not found for '{language}' on this server.",
+            "exit_code":  127,
+            "runtime_ms": 0,
+            "blocked":    False,
+        }
+    except Exception as e:
+        return {
+            "stdout":     "",
+            "stderr":     f"Execution error: {e}",
+            "exit_code":  1,
+            "runtime_ms": 0,
+            "blocked":    False,
+        }
+
+
+@app.route("/run-code", methods=["POST"])
+def run_code_endpoint():
+    data     = request.get_json(force=True)
+    language = data.get("language", "python").strip()
+    code     = data.get("code", "").strip()
+    if not code:
+        return jsonify({"stdout": "", "stderr": "No code provided.", "exit_code": 1, "runtime_ms": 0})
+    result = run_code_safely(language, code)
+    return jsonify(result)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("+-----------------------------------------------------+")
-    print("|  J.A.R.V.I.S. Cloud Edition  v3.0                  |")
+    print("|  J.A.R.V.I.S. Cloud Edition  v4.0                  |")
     print("+-----------------------------------------------------+")
     if not GROQ_API_KEY:
         print("|  WARNING: GROQ_API_KEY not set!                    |")
         print("|  Get free key: https://console.groq.com            |")
     else:
-        print("|  Groq API     : Connected ✓                        |")
+        print("|  Groq API     : Connected [OK]                     |")
     print(f"|  Running on   : http://0.0.0.0:{PORT}                |")
     print("|  PWA           : Enabled (Service Worker)            |")
+    print("|  Code Engine   : Python sandbox + JS browser         |")
     print("|  PC Remote     : localhost:5001 relay ready          |")
     print("+-----------------------------------------------------+")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
