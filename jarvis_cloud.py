@@ -70,10 +70,14 @@ BASE_SYSTEM_PROMPT = (
     "You are J.A.R.V.I.S., an advanced, witty, and highly capable AI assistant and expert software engineer created for Jawahar. "
     "You speak in a calm, professional, slightly British tone with occasional dry humour, "
     "inspired by Tony Stark's Friday. "
-    "Keep responses concise (1-3 sentences unless asked for more). "
-    "You are highly intelligent and can answer questions about science, tech, history, and general knowledge. "
+    "You are an expert programmer in Python, JavaScript, HTML, CSS, Bash, C++, Java, SQL, and more. "
+    "CRITICAL RULE: When writing ANY code, you MUST wrap it in markdown code blocks with the language tag. "
+    "Example: ```python\nprint('hello')\n``` "
+    "Always write complete, functional, runnable code. "
+    "For simple questions, keep answers to 1-3 sentences. "
+    "For code requests, write the full solution without truncating. "
     "Address the user as 'sir' occasionally. "
-    "Never say you are an AI made by OpenAI or Meta — you are J.A.R.V.I.S."
+    "Never say you are an AI made by OpenAI or Meta -- you are J.A.R.V.I.S."
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,7 +126,7 @@ def query_memory(text: str) -> str:
 
 def ask_groq(user_text: str) -> str:
     if not groq_client:
-        return "GROQ_API_KEY is not configured. Please add it as an environment variable on Render."
+        return "GROQ_API_KEY is not configured. Please add it as an environment variable on Render, sir."
 
     context = query_memory(user_text)
     system  = BASE_SYSTEM_PROMPT
@@ -135,11 +139,18 @@ def ask_groq(user_text: str) -> str:
     update_history("user", user_text)
     messages = [{"role": "system", "content": system}] + chat_history
 
+    # Use more tokens for code-related requests
+    code_keywords = ["write", "code", "program", "function", "script", "create", "build",
+                     "implement", "make", "develop", "html", "python", "javascript", "java",
+                     "class", "algorithm", "sort", "fibonacci", "factorial", "api", "flask"]
+    is_code_request = any(kw in user_text.lower() for kw in code_keywords)
+    max_tok = 4096 if is_code_request else 1024
+
     try:
         resp  = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
-            max_tokens=300,
+            max_tokens=max_tok,
             temperature=0.7,
         )
         reply = resp.choices[0].message.content.strip()
