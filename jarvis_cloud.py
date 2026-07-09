@@ -125,9 +125,11 @@ def query_memory(text: str) -> str:
     except Exception:
         return ""
 
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 def ask_groq(user_text: str) -> str:
-    if not groq_client:
-        return "GROQ_API_KEY is not configured. Please add it as an environment variable on Render, sir."
+    if not GROQ_API_KEY:
+        return "GROQ_API_KEY is not configured. Please add it on Render, sir."
 
     context = query_memory(user_text)
     system  = BASE_SYSTEM_PROMPT
@@ -140,27 +142,53 @@ def ask_groq(user_text: str) -> str:
     update_history("user", user_text)
     messages = [{"role": "system", "content": system}] + chat_history
 
-    # Use fast model for simple chat, full model for code
+    # Fast model for chat, full model for code
     code_keywords = ["write", "code", "program", "function", "script", "create", "build",
                      "implement", "make", "develop", "html", "python", "javascript", "java",
                      "class", "algorithm", "sort", "fibonacci", "factorial", "api", "flask"]
-    is_code_request = any(kw in user_text.lower() for kw in code_keywords)
-    model   = GROQ_MODEL if is_code_request else GROQ_MODEL_FAST
-    max_tok = 4096 if is_code_request else 1024
+    is_code = any(kw in user_text.lower() for kw in code_keywords)
+    model   = GROQ_MODEL if is_code else GROQ_MODEL_FAST
+    max_tok = 4096 if is_code else 1024
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "model":       model,
+        "messages":    messages,
+        "max_tokens":  max_tok,
+        "temperature": 0.7,
+    }
 
     try:
-        resp  = groq_client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tok,
-            temperature=0.7,
+        # Use raw HTTP with strict 20s timeout — SDK can hang indefinitely
+        resp  = http_requests.post(
+            GROQ_API_URL,
+            headers=headers,
+            json=payload,
+            timeout=20,
         )
-        reply = resp.choices[0].message.content.strip()
+        if resp.status_code == 200:
+            reply = resp.json()["choices"][0]["message"]["content"].strip()
+        elif resp.status_code == 400:
+            # Model might not exist, try fallback model
+            payload["model"] = "llama3-8b-8192"
+            resp2 = http_requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
+            if resp2.status_code == 200:
+                reply = resp2.json()["choices"][0]["message"]["content"].strip()
+            else:
+                reply = f"API error {resp2.status_code}: {resp2.text[:200]}"
+        else:
+            reply = f"Groq API error {resp.status_code}: {resp.text[:200]}"
+    except http_requests.Timeout:
+        reply = "Neural core timed out. The AI service is slow — please try again in a moment, sir."
     except Exception as e:
-        reply = f"Neural core error: {e}"
+        reply = f"Connection error: {e}"
 
     update_history("assistant", reply)
     return reply
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMMAND ROUTER
