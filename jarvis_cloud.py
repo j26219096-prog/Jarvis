@@ -51,7 +51,8 @@ from flask import Flask, request, jsonify, render_template_string, Response
 # ══════════════════════════════════════════════════════════════════════════════
 
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL     = "llama3-70b-8192"
+GROQ_MODEL         = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")  # Current Groq model
+GROQ_MODEL_FAST    = "llama-3.1-8b-instant"   # Fast fallback for simple queries
 NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
 MAX_HISTORY    = 8
 PORT           = int(os.environ.get("PORT", 5000))
@@ -139,16 +140,17 @@ def ask_groq(user_text: str) -> str:
     update_history("user", user_text)
     messages = [{"role": "system", "content": system}] + chat_history
 
-    # Use more tokens for code-related requests
+    # Use fast model for simple chat, full model for code
     code_keywords = ["write", "code", "program", "function", "script", "create", "build",
                      "implement", "make", "develop", "html", "python", "javascript", "java",
                      "class", "algorithm", "sort", "fibonacci", "factorial", "api", "flask"]
     is_code_request = any(kw in user_text.lower() for kw in code_keywords)
+    model   = GROQ_MODEL if is_code_request else GROQ_MODEL_FAST
     max_tok = 4096 if is_code_request else 1024
 
     try:
         resp  = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=model,
             messages=messages,
             max_tokens=max_tok,
             temperature=0.7,
