@@ -1828,7 +1828,7 @@ function renderCodeBlocks(text) {
           <span class="jcb-lang">${lang.toUpperCase()}</span>
           <div class="jcb-btns">
             <button class="jcb-btn jcb-copy" onclick="copyBlock('${blockId}')">COPY</button>
-            <button class="jcb-btn jcb-run"  onclick="openIDE(getBlock('${blockId}'),'${lang}')">RUN</button>
+            <button class="jcb-btn jcb-run"  onclick="openIDEFromBlock(getBlock('${blockId}'),'${lang}')">▶ RUN</button>
           </div>
         </div>
         <div class="jcb-code" id="${blockId}">
@@ -1854,9 +1854,44 @@ function getBlock(id) {
   return el ? el.querySelector('code').textContent : '';
 }
 
+/* ── Clipboard copy with full fallback for all mobile browsers ── */
 function copyBlock(id) {
   const code = getBlock(id);
-  navigator.clipboard.writeText(code).then(() => showToast('CODE COPIED', 'green'));
+  const btn  = document.querySelector(`[onclick="copyBlock('${id}')"]`);
+  const done = () => {
+    if (btn) { btn.textContent = '✓ COPIED'; btn.style.color = '#00ff88'; }
+    showToast('CODE COPIED ✓', 'green');
+    setTimeout(() => { if (btn) { btn.textContent = 'COPY'; btn.style.color = ''; } }, 1800);
+  };
+  const fail = () => {
+    // Fallback: create hidden textarea, select and copy
+    const ta = document.createElement('textarea');
+    ta.value = code;
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;z-index:9999;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      const ok = document.execCommand('copy');
+      if (ok) done(); else showToast('LONG PRESS CODE TO COPY', 'red');
+    } catch(e) { showToast('LONG PRESS CODE TO COPY', 'red'); }
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(code).then(done).catch(fail);
+  } else {
+    fail();
+  }
+}
+
+/* ── Open IDE panel and scroll to it on mobile ── */
+function openIDEFromBlock(code, lang) {
+  openIDE(code, lang);
+  // Scroll IDE panel into view on mobile
+  setTimeout(() => {
+    const panel = document.getElementById('codePanel');
+    if (panel) panel.scrollIntoView({behavior: 'smooth'});
+  }, 100);
 }
 
 /* ── Override typewrite to support code blocks ── */
