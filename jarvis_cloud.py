@@ -204,14 +204,16 @@ def execute_command(command: str) -> dict:
             return {"reply": f"Searching YouTube for {query}.", "action": "open_url", "url": url, "url_label": "YOUTUBE"}
         return {"reply": "Opening YouTube.", "action": "open_url", "url": "https://www.youtube.com", "url_label": "YOUTUBE"}
 
-    # ── Wikipedia ────────────────────────────────────────────────────────────
-    if any(kw in command for kw in ["wikipedia", "who is", "what is", "tell me about", "explain"]):
-        query = command
-        for filler in ["wikipedia", "search for", "search", "tell me about", "who is", "what is", "explain", "jarvis"]:
-            query = query.replace(filler, "")
+    # ── Wikipedia ─────────────────────────────────────────────────────────────
+    # Only trigger on explicit wikipedia requests, not general 'what is' questions
+    if "wikipedia" in command or command.startswith("search ") and any(kw in command for kw in ["who is", "what is"]):
+        query = command_raw
+        for filler in ["wikipedia", "search wikipedia for", "search for", "search", "tell me about",
+                       "who is", "what is", "explain", "jarvis"]:
+            query = query.replace(filler, "").replace(filler.title(), "")
         query = query.strip()
         if not query:
-            return {"reply": "What would you like me to search for?", "action": None}
+            return {"reply": "What would you like me to search on Wikipedia?", "action": None}
         return {"reply": wiki_search(query), "action": None}
 
     # ── Memory save ──────────────────────────────────────────────────────────
@@ -432,12 +434,35 @@ def world_monitor() -> dict:
 
 
 def wiki_search(query: str) -> str:
+    """Search Wikipedia using their fast REST API — no library needed."""
     try:
-        return wikipedia.summary(query, sentences=2, auto_suggest=True)
-    except wikipedia.exceptions.DisambiguationError as e:
-        return f"Multiple results. Did you mean: {e.options[0]}?"
-    except wikipedia.exceptions.PageError:
-        return "No Wikipedia page found for that topic."
+        # Use Wikipedia's official REST API (fast, reliable)
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
+        r = http_requests.get(url, timeout=10,
+                              headers={"User-Agent": "JARVIS-AI/4.0 (educational project)"})
+        if r.status_code == 200:
+            data = r.json()
+            extract = data.get("extract", "")
+            title   = data.get("title", query)
+            if extract:
+                # Return first 2 sentences max
+                sentences = extract.split(". ")
+                summary = ". ".join(sentences[:2]) + (".") if len(sentences) >= 2 else extract
+                return f"{title}: {summary}"
+            return f"No summary found for {query}."
+        elif r.status_code == 404:
+            # Try search API to find closest match
+            search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json&srlimit=1"
+            sr = http_requests.get(search_url, timeout=8,
+                                   headers={"User-Agent": "JARVIS-AI/4.0"})
+            results = sr.json().get("query", {}).get("search", [])
+            if results:
+                return f"No exact page found. Did you mean: {results[0]['title']}? Ask me to search Wikipedia for that."
+            return f"No Wikipedia page found for '{query}'."
+        else:
+            return f"Wikipedia returned status {r.status_code} for '{query}'."
+    except http_requests.Timeout:
+        return "Wikipedia search timed out. Please try again, sir."
     except Exception as e:
         return f"Wikipedia error: {e}"
 
