@@ -68,7 +68,7 @@ except ImportError:
     groq_client = None
 
 BASE_SYSTEM_PROMPT = (
-    "You are J.A.R.V.I.S., an advanced, witty, and highly capable AI assistant and expert software engineer created for Jawahar. "
+    "You are JARVIS., an advanced, witty, and highly capable AI assistant and expert software engineer created for Jawahar. "
     "You speak in a calm, professional, slightly British tone with occasional dry humour, "
     "inspired by Tony Stark's Friday. "
     "You are an expert programmer in Python, JavaScript, HTML, CSS, Bash, C++, Java, SQL, and more. "
@@ -1118,7 +1118,7 @@ function openVoicePicker() {
         localStorage.setItem('jarvisVoiceURI', v.voiceURI);
         closeVoicePicker();
         synth.cancel();
-        const u = new SpeechSynthesisUtterance('Voice confirmed. I am J.A.R.V.I.S., at your service, sir.');
+        const u = new SpeechSynthesisUtterance('Voice confirmed. I am JARVIS, at your service, sir.');
         u.voice = v; u.rate = 0.88; u.pitch = 0.72; u.volume = 1;
         synth.speak(u);
         showToast('VOICE SET: ' + v.name.toUpperCase());
@@ -1127,7 +1127,7 @@ function openVoicePicker() {
       item.querySelector('.vtest-btn').addEventListener('click', e => {
         e.stopPropagation();
         synth.cancel();
-        const u = new SpeechSynthesisUtterance('Systems online. J.A.R.V.I.S. at your service.');
+        const u = new SpeechSynthesisUtterance('Systems online. JARVIS at your service.');
         u.voice = v; u.rate = 0.88; u.pitch = 0.72; u.volume = 1;
         synth.speak(u);
       });
@@ -2159,7 +2159,7 @@ def offline():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name":             "J.A.R.V.I.S.",
+        "name":             "JARVIS",
         "short_name":       "JARVIS",
         "description":      "Advanced AI Assistant — 24/7 voice-controlled online & offline",
         "start_url":        "/?pwa=1",
