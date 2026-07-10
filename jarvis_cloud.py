@@ -21,7 +21,7 @@ Deploy to Render.com (free):
   5. Add to Home Screen on phone = native app experience
 
 Local test:
-  pip install flask groq chromadb requests wikipedia gunicorn
+  pip install flask groq requests wikipedia gunicorn
   set GROQ_API_KEY=your_key_here
   python jarvis_cloud.py
 """
@@ -42,7 +42,6 @@ IST = ZoneInfo("Asia/Kolkata")
 import threading
 import requests as http_requests
 import wikipedia
-import chromadb
 
 from flask import Flask, request, jsonify, render_template_string, Response
 
@@ -51,8 +50,9 @@ from flask import Flask, request, jsonify, render_template_string, Response
 # ══════════════════════════════════════════════════════════════════════════════
 
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL         = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")  # Current Groq model
-GROQ_MODEL_FAST    = "llama-3.1-8b-instant"   # Fast fallback for simple queries
+# Groq deprecated llama-3.x models in June 2026 — use current replacements
+GROQ_MODEL         = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_MODEL_FAST    = os.environ.get("GROQ_MODEL_FAST", "openai/gpt-oss-20b")
 NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
 MAX_HISTORY    = 8
 PORT           = int(os.environ.get("PORT", 5000))
@@ -82,26 +82,11 @@ BASE_SYSTEM_PROMPT = (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHROMADB  (EphemeralClient — works on cloud with no local disk)
+# IN-MEMORY KNOWLEDGE (lightweight — ChromaDB blocked Render free tier workers)
 # ══════════════════════════════════════════════════════════════════════════════
 
-try:
-    chroma_client     = chromadb.EphemeralClient()
-    memory_collection = chroma_client.get_or_create_collection(
-        name="personal_knowledge",
-        metadata={"hnsw:space": "cosine"}
-    )
-    MEMORY_AVAILABLE = True
-    print("[BOOT] ChromaDB (ephemeral) ready.")
-except Exception as e:
-    memory_collection = None
-    MEMORY_AVAILABLE  = False
-    print(f"[BOOT] ChromaDB unavailable: {e}")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IN-MEMORY NOTES (persists during session)
-# ══════════════════════════════════════════════════════════════════════════════
-
+MEMORY_AVAILABLE = True
+memory_docs: list[dict] = []   # {"text": "...", "time": "..."}
 session_notes: list[dict] = []  # {"text": "...", "time": "..."}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,14 +101,16 @@ def update_history(role: str, content: str) -> None:
         del chat_history[:len(chat_history) - MAX_HISTORY * 2]
 
 def query_memory(text: str) -> str:
-    if not MEMORY_AVAILABLE or not memory_collection or memory_collection.count() == 0:
+    if not memory_docs:
         return ""
-    try:
-        res  = memory_collection.query(query_texts=[text], n_results=min(3, memory_collection.count()))
-        docs = res.get("documents", [[]])[0]
-        return "\n\n".join(f"[Memory {i+1}]: {d}" for i, d in enumerate(docs)) if docs else ""
-    except Exception:
-        return ""
+    query = text.lower()
+    matches = [
+        doc["text"] for doc in memory_docs
+        if any(word in doc["text"].lower() for word in query.split() if len(word) > 2)
+    ]
+    if not matches:
+        matches = [doc["text"] for doc in memory_docs[-3:]]
+    return "\n\n".join(f"[Memory {i+1}]: {d}" for i, d in enumerate(matches[:3]))
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -171,14 +158,17 @@ def ask_groq(user_text: str) -> str:
         )
         if resp.status_code == 200:
             reply = resp.json()["choices"][0]["message"]["content"].strip()
-        elif resp.status_code == 400:
-            # Model might not exist, try fallback model
-            payload["model"] = "llama3-8b-8192"
-            resp2 = http_requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
-            if resp2.status_code == 200:
-                reply = resp2.json()["choices"][0]["message"]["content"].strip()
-            else:
-                reply = f"API error {resp2.status_code}: {resp2.text[:200]}"
+        elif resp.status_code in (400, 404):
+            reply = f"Groq API error {resp.status_code}: {resp.text[:200]}"
+            for fallback in (GROQ_MODEL_FAST, GROQ_MODEL):
+                if payload["model"] == fallback:
+                    continue
+                payload["model"] = fallback
+                resp2 = http_requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
+                if resp2.status_code == 200:
+                    reply = resp2.json()["choices"][0]["message"]["content"].strip()
+                    break
+                reply = f"Groq API error {resp2.status_code}: {resp2.text[:200]}"
         else:
             reply = f"Groq API error {resp.status_code}: {resp.text[:200]}"
     except http_requests.Timeout:
@@ -230,14 +220,11 @@ def execute_command(command: str) -> dict:
         for t in ["remember this", "save to memory", "note this", "take a note", "add note", "jarvis"]:
             note = note.replace(t, "").replace(t.lower(), "")
         note = note.strip(": ").strip()
-        if note and MEMORY_AVAILABLE:
-            try:
-                memory_collection.add(documents=[note], ids=[f"mem_{int(time.time())}"])
-            except Exception:
-                pass
         if note:
             now_str = datetime.datetime.now(IST).strftime("%I:%M %p")
-            session_notes.append({"text": note, "time": now_str})
+            entry = {"text": note, "time": now_str}
+            memory_docs.append(entry)
+            session_notes.append(entry)
             return {"reply": f"Noted. I've saved: \"{note}\"", "action": "note_saved", "note": note}
         return {"reply": "What would you like me to remember?", "action": None}
 
@@ -1201,7 +1188,6 @@ function typewrite(text) {
     if (i < text.length) { rTxt.textContent += text[i++]; }
     else {
       rTxt.className = 'resp-txt';
-      t
       clearInterval(twTimer); twTimer = null;
       setTimeout(() => setState('idle'), 2500);
     }
@@ -1341,6 +1327,9 @@ async function runCmd(text) {
       signal: controller.signal
     });
     clearTimeout(timeoutId);
+    if (!res.ok) {
+      throw new Error(`Server returned ${res.status}`);
+    }
     const data = await res.json();
     const reply = data.reply || 'No response received.';
     setState('speaking');
@@ -1365,7 +1354,7 @@ async function runCmd(text) {
     } else if (!navigator.onLine) {
       msg = 'Offline mode — limited functionality available.';
     } else {
-      msg = 'Neural link disrupted. The server may be starting up — please try again in 15 seconds, sir.';
+      msg = `Neural link disrupted: ${e.message || 'request failed'}. If this persists, check GROQ_API_KEY on Render, sir.`;
     }
     typewrite(msg);
   }
@@ -2027,12 +2016,16 @@ def greet():
 
 @app.route("/command", methods=["POST"])
 def command():
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True) or {}
     cmd  = data.get("command", "").strip()
     if not cmd:
         return jsonify({"reply": "I didn't receive a command.", "action": None})
-    result = execute_command(cmd)
-    return jsonify(result)
+    try:
+        result = execute_command(cmd)
+        return jsonify(result)
+    except Exception as e:
+        print(f"[ERROR] /command failed: {e}")
+        return jsonify({"reply": f"Internal error: {e}", "action": None}), 500
 
 @app.route("/pc-command", methods=["POST"])
 def pc_command_relay():
@@ -2050,11 +2043,12 @@ def pc_command_relay():
 def status():
     return jsonify({
         "status":  "online",
-        "version": "4.0",
+        "version": "4.1",
         "model":   GROQ_MODEL,
+        "model_fast": GROQ_MODEL_FAST,
         "memory":  MEMORY_AVAILABLE,
-        "docs":    memory_collection.count() if MEMORY_AVAILABLE else 0,
-        "groq_ok": bool(groq_client),
+        "docs":    len(memory_docs),
+        "groq_ok": bool(GROQ_API_KEY),
     })
 
 @app.route("/ping")
@@ -2067,9 +2061,31 @@ def health():
     """Health check for monitoring."""
     return jsonify({
         "ok":      True,
-        "groq":    bool(groq_client),
+        "groq":    bool(GROQ_API_KEY),
         "memory":  MEMORY_AVAILABLE,
     })
+
+@app.route("/debug-groq")
+def debug_groq():
+    """Test Groq API directly — returns raw status and error for diagnostics."""
+    if not GROQ_API_KEY:
+        return jsonify({"error": "GROQ_API_KEY not set"}), 400
+    try:
+        r = http_requests.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": GROQ_MODEL_FAST, "messages": [{"role": "user", "content": "say hi"}], "max_tokens": 10},
+            timeout=10,
+        )
+        return jsonify({
+            "http_status": r.status_code,
+            "body":        r.json() if r.headers.get("content-type","").startswith("application/json") else r.text[:300],
+            "model":       GROQ_MODEL_FAST,
+        })
+    except http_requests.Timeout:
+        return jsonify({"error": "Groq API timed out after 10s", "model": GROQ_MODEL_FAST}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/sw.js")
 def service_worker():
