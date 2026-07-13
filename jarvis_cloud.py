@@ -636,7 +636,7 @@ HTML_PAGE = r"""
     .query-line{font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:var(--muted);margin-bottom:8px;padding-bottom:7px;border-bottom:1px solid rgba(0,212,255,0.08);display:none;}
     .query-line.on{display:block;}
     .query-line::before{content:'> ';color:rgba(0,212,255,0.35);}
-    .resp-txt{font-size:1.05rem;line-height:1.65;color:var(--text);min-height:48px;white-space:pre-wrap;}
+    .resp-txt{font-size:1.05rem;line-height:1.65;color:var(--text);min-height:48px;white-space:pre-wrap;user-select:text;-webkit-user-select:text;}
     .resp-txt.blink::after{content:'|';animation:cur-blink 0.6s infinite;color:var(--blue);margin-left:1px;}
     @keyframes cur-blink{0%,100%{opacity:1;}50%{opacity:0;}}
     .tdots{display:none;gap:5px;margin-top:8px;}
@@ -1043,6 +1043,7 @@ function detectGender(voice) {
 }
 
 function loadVoices() {
+  if (!synth) return;
   voices = synth.getVoices();
   const saved = localStorage.getItem('jarvisVoiceURI');
   if (saved && !selVoice) {
@@ -1117,19 +1118,19 @@ function openVoicePicker() {
         selVoice = v;
         localStorage.setItem('jarvisVoiceURI', v.voiceURI);
         closeVoicePicker();
-        synth.cancel();
+        if (synth) synth.cancel();
         const u = new SpeechSynthesisUtterance('Voice confirmed. I am JARVIS, at your service, sir.');
         u.voice = v; u.rate = 0.88; u.pitch = 0.72; u.volume = 1;
-        synth.speak(u);
+        if (synth) synth.speak(u);
         showToast('VOICE SET: ' + v.name.toUpperCase());
       });
       // Test button
       item.querySelector('.vtest-btn').addEventListener('click', e => {
         e.stopPropagation();
-        synth.cancel();
+        if (synth) synth.cancel();
         const u = new SpeechSynthesisUtterance('Systems online. JARVIS at your service.');
         u.voice = v; u.rate = 0.88; u.pitch = 0.72; u.volume = 1;
-        synth.speak(u);
+        if (synth) synth.speak(u);
       });
       list.appendChild(item);
     });
@@ -1334,7 +1335,7 @@ function handleSpecialAction(data) {
 /* ── Main command runner ── */
 async function runCmd(text) {
   if (!text || appState === 'thinking') return;
-  synth.cancel();
+  if (synth) synth.cancel();
   setState('thinking');
   qLine.textContent = text; qLine.className = 'query-line on';
   rTxt.textContent = ''; rTxt.className = 'resp-txt';
@@ -1430,9 +1431,8 @@ if (!SR) {
 function toggleMic() {
   if (!rec) return;
   if (micActive) { rec.stop(); micActive = false; setState('idle'); }
-  else {
     if (appState === 'thinking') return;
-    synth.cancel();
+    if (synth) synth.cancel();
     try { rec.start(); micActive = true; setState('listening'); }
     catch(e) { micActive = false; setState('idle'); showToast('MIC UNAVAILABLE', 'red'); }
   }
@@ -1498,14 +1498,18 @@ if (firstVisit && synth) {
 
 /* ── Greeting on load ── */
 (async () => {
+  const controller = new AbortController();
+  const tId = setTimeout(() => controller.abort(), 4000);
   try {
-    const res  = await fetch('/greet');
+    const res  = await fetch('/greet', { signal: controller.signal });
     const data = await res.json();
+    clearTimeout(tId);
     setState('speaking');
     typewrite(data.greeting);
     speak(data.greeting);
   } catch(e) {
-    typewrite('J.A.R.V.I.S. online. Tap the reactor to speak, or type below.');
+    clearTimeout(tId);
+    typewrite('JARVIS online. Tap the reactor to speak, or type below.');
     setState('idle');
   }
 })();
@@ -1569,6 +1573,7 @@ if (firstVisit && synth) {
   .ide-code-wrap {
     flex:1;overflow:auto;background:#0d1117;
     position:relative;
+    user-select:text;-webkit-user-select:text;
   }
   .ide-code-wrap pre {
     margin:0;padding:16px;
@@ -1609,6 +1614,7 @@ if (firstVisit && synth) {
     border-top:1px solid rgba(0,255,136,0.12);
     font-family:'Share Tech Mono',monospace;font-size:0.78rem;
     padding:12px 14px;display:none;flex-direction:column;gap:4px;
+    user-select:text;-webkit-user-select:text;
   }
   .ide-output.on { display:flex; }
   .out-hdr {
@@ -1654,7 +1660,7 @@ if (firstVisit && synth) {
   .jcb-copy:active { background:rgba(0,255,136,0.12); }
   .jcb-run  { color:#00d4ff;border-color:rgba(0,212,255,0.35); }
   .jcb-run:active  { background:rgba(0,212,255,0.12); }
-  .jcb-code { padding:12px;overflow-x:auto;max-height:260px;overflow-y:auto; }
+  .jcb-code { padding:12px;overflow-x:auto;max-height:260px;overflow-y:auto;user-select:text;-webkit-user-select:text; }
   .jcb-code pre { margin:0; }
   .jcb-code code {
     font-family:'Share Tech Mono',monospace !important;
