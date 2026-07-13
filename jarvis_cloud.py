@@ -632,7 +632,15 @@ HTML_PAGE = r"""
     }
     .holo-panel::before{content:'';position:absolute;top:-1px;left:22px;width:48px;height:2px;background:linear-gradient(90deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);}
     .holo-panel::after{content:'';position:absolute;bottom:-1px;right:22px;width:48px;height:2px;background:linear-gradient(270deg,var(--blue),transparent);box-shadow:0 0 8px var(--blue);}
-    .panel-lbl{font-family:'Orbitron',monospace;font-size:0.5rem;letter-spacing:3px;color:rgba(0,212,255,0.45);margin-bottom:9px;}
+    .panel-lbl{font-family:'Orbitron',monospace;font-size:0.5rem;letter-spacing:3px;color:rgba(0,212,255,0.45);}
+    .panel-lbl-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;gap:8px;}
+    .copy-resp-btn{
+      flex-shrink:0;background:none;border:1px solid var(--muted);color:var(--muted);
+      border-radius:5px;padding:3px 9px;cursor:pointer;
+      font-family:'Share Tech Mono',monospace;font-size:0.58rem;letter-spacing:1px;
+      transition:all 0.15s;
+    }
+    .copy-resp-btn:active{border-color:var(--green);color:var(--green);}
     .query-line{font-family:'Share Tech Mono',monospace;font-size:0.7rem;color:var(--muted);margin-bottom:8px;padding-bottom:7px;border-bottom:1px solid rgba(0,212,255,0.08);display:none;}
     .query-line.on{display:block;}
     .query-line::before{content:'> ';color:rgba(0,212,255,0.35);}
@@ -888,7 +896,10 @@ HTML_PAGE = r"""
 
 <div class="resp-area">
   <div class="holo-panel">
-    <div class="panel-lbl">◈ JARVIS OUTPUT</div>
+    <div class="panel-lbl-row">
+      <div class="panel-lbl">◈ JARVIS OUTPUT</div>
+      <button class="copy-resp-btn" id="copyRespBtn" onclick="copyResponse()" title="Copy this response">📋 COPY</button>
+    </div>
     <div class="query-line" id="qLine"></div>
     <div class="resp-txt" id="rTxt">Initialising systems…</div>
     <div class="tdots" id="tDots"><b></b><b></b><b></b></div>
@@ -1206,7 +1217,9 @@ function setState(s) {
 }
 
 let twTimer = null;
+let lastReplyText = '';
 let typewrite = function(text) {
+  lastReplyText = text;
   if (twTimer) clearInterval(twTimer);
   rTxt.className = 'resp-txt blink'; rTxt.textContent = '';
   let i = 0;
@@ -1918,6 +1931,36 @@ function copyBlock(id) {
   }
 }
 
+/* ── Copy the full JARVIS response text (plain, incl. code fences) ── */
+function copyResponse() {
+  const text = lastReplyText || rTxt.textContent || '';
+  const btn  = document.getElementById('copyRespBtn');
+  const done = () => {
+    if (btn) { btn.textContent = '✓ COPIED'; btn.style.color = 'var(--green)'; btn.style.borderColor = 'var(--green)'; }
+    showToast('RESPONSE COPIED ✓', 'green');
+    setTimeout(() => { if (btn) { btn.textContent = '📋 COPY'; btn.style.color = ''; btn.style.borderColor = ''; } }, 1800);
+  };
+  const fail = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;z-index:9999;';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+      const ok = document.execCommand('copy');
+      if (ok) done(); else showToast('LONG PRESS TEXT TO COPY', 'red');
+    } catch(e) { showToast('LONG PRESS TEXT TO COPY', 'red'); }
+    document.body.removeChild(ta);
+  };
+  if (!text.trim()) { showToast('NOTHING TO COPY YET', 'red'); return; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(fail);
+  } else {
+    fail();
+  }
+}
+
 /* ── Open IDE panel and scroll to it on mobile ── */
 function openIDEFromBlock(code, lang) {
   openIDE(code, lang);
@@ -1933,6 +1976,7 @@ let typewriteActive = false;
 const _origTypewrite = typewrite;
 typewrite = function(text) {
   typewriteActive = true;
+  lastReplyText = text;
   if (twTimer) clearInterval(twTimer);
   const codeHtml = renderCodeBlocks(text);
   if (codeHtml) {
@@ -2231,9 +2275,7 @@ import signal
 import tempfile
 import shutil
 
-# Languages supported server-side
-SERVER_LANGS = {"python", "python3", "py", "bash", "sh", "shell"}
-# Languages run client-side (JS, HTML) — handled in frontend
+import re as _re_mod
 
 # Dangerous patterns blocked in user Python code
 DANGEROUS_PATTERNS = [
@@ -2244,9 +2286,45 @@ DANGEROUS_PATTERNS = [
     "sys.exit", "exit()", "quit()",
 ]
 
+# ── Language registry ──────────────────────────────────────────────────────
+# Each entry: file extension, whether it needs a compile step, the binary(ies)
+# required (checked with shutil.which so we fail gracefully instead of crashing
+# if a language runtime simply isn't installed on this server), and how to
+# build the run/compile commands given file paths.
+LANGUAGE_REGISTRY = {
+    "python":     {"ext": "py",  "interpreter": [sys.executable]},
+    "python3":    {"ext": "py",  "interpreter": [sys.executable]},
+    "py":         {"ext": "py",  "interpreter": [sys.executable]},
+    "bash":       {"ext": "sh",  "interpreter": ["bash"]},
+    "sh":         {"ext": "sh",  "interpreter": ["bash"]},
+    "shell":      {"ext": "sh",  "interpreter": ["bash"]},
+    "node":       {"ext": "js",  "interpreter": ["node"]},
+    "javascript": {"ext": "js",  "interpreter": ["node"]},
+    "js":         {"ext": "js",  "interpreter": ["node"]},
+    "ruby":       {"ext": "rb",  "interpreter": ["ruby"]},
+    "rb":         {"ext": "rb",  "interpreter": ["ruby"]},
+    "php":        {"ext": "php", "interpreter": ["php"]},
+    "perl":       {"ext": "pl",  "interpreter": ["perl"]},
+    "lua":        {"ext": "lua", "interpreter": ["lua"]},
+    "go":         {"ext": "go",  "interpreter": ["go", "run"]},
+    "c":          {"ext": "c",   "compiler": ["gcc"],  "compile_extra": ["-O2", "-lm"]},
+    "cpp":        {"ext": "cpp", "compiler": ["g++"],  "compile_extra": ["-O2", "-std=c++17"]},
+    "c++":        {"ext": "cpp", "compiler": ["g++"],  "compile_extra": ["-O2", "-std=c++17"]},
+    "java":       {"ext": "java", "compiler": ["javac"], "runner": ["java"], "needs_classname": True},
+}
+
+def _extract_java_class_name(code: str) -> str:
+    m = _re_mod.search(r'\bpublic\s+class\s+(\w+)', code)
+    if m:
+        return m.group(1)
+    m = _re_mod.search(r'\bclass\s+(\w+)', code)
+    return m.group(1) if m else "Main"
+
 def run_code_safely(language: str, code: str) -> dict:
     """
-    Execute code in a sandboxed subprocess.
+    Execute code in a sandboxed subprocess. Supports interpreted languages
+    (Python, Bash, Node, Ruby, PHP, Perl, Lua, Go) and compiled languages
+    (C, C++, Java) when the relevant toolchain is present on the server.
     Returns: {stdout, stderr, exit_code, runtime_ms, blocked}
     """
     lang = language.lower().strip()
@@ -2265,65 +2343,108 @@ def run_code_safely(language: str, code: str) -> dict:
                     "blocked": True,
                 }
 
-    # ── Map language to command ──
-    if lang in ("python", "python3", "py"):
-        cmd = [sys.executable, "-c", code]
-    elif lang in ("bash", "sh", "shell"):
-        cmd = ["bash", "-c", code]
-    else:
+    cfg = LANGUAGE_REGISTRY.get(lang)
+    if not cfg:
         return {
             "stdout": "",
-            "stderr": f"Server-side execution not supported for '{language}'. "
-                      "JavaScript and HTML run in your browser.",
+            "stderr": f"Server-side execution not supported for '{language}' yet, sir. "
+                      "JavaScript and HTML run directly in your browser instead.",
             "exit_code": 1,
             "runtime_ms": 0,
             "blocked": False,
         }
 
-    # ── Execute with timeout ──
     start = time.time()
+    workdir = tempfile.mkdtemp(prefix="jarvis_run_")
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,           # Hard 10-second limit
-            cwd=tempfile.gettempdir(),
-        )
-        runtime_ms = int((time.time() - start) * 1000)
-        stdout = result.stdout[:50_000]   # Cap at 50 KB
-        stderr = result.stderr[:10_000]
+        # ── Compiled languages: compile first, then run the binary ──
+        if "compiler" in cfg:
+            compiler_bin = cfg["compiler"][0]
+            if shutil.which(compiler_bin) is None:
+                return {
+                    "stdout": "",
+                    "stderr": f"'{compiler_bin}' is not installed on this server, sir. "
+                              f"{language.upper()} execution needs it added to the Render environment.",
+                    "exit_code": 127, "runtime_ms": 0, "blocked": False,
+                }
+
+            if cfg.get("needs_classname"):
+                classname = _extract_java_class_name(code)
+                src_path  = os.path.join(workdir, f"{classname}.{cfg['ext']}")
+            else:
+                src_path  = os.path.join(workdir, f"program.{cfg['ext']}")
+                out_path  = os.path.join(workdir, "program.out")
+
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            if cfg.get("needs_classname"):
+                compile_cmd = cfg["compiler"] + [src_path]
+            else:
+                compile_cmd = cfg["compiler"] + [src_path] + cfg.get("compile_extra", []) + ["-o", out_path]
+
+            compile_res = subprocess.run(
+                compile_cmd, capture_output=True, text=True, timeout=15, cwd=workdir,
+            )
+            if compile_res.returncode != 0:
+                return {
+                    "stdout": "",
+                    "stderr": "[COMPILE ERROR]\n" + compile_res.stderr[:10_000],
+                    "exit_code": compile_res.returncode,
+                    "runtime_ms": int((time.time() - start) * 1000),
+                    "blocked": False,
+                }
+
+            run_cmd = (cfg["runner"] + [classname]) if cfg.get("needs_classname") else [out_path]
+            run_start = time.time()
+            result = subprocess.run(
+                run_cmd, capture_output=True, text=True, timeout=10, cwd=workdir,
+            )
+            runtime_ms = int((time.time() - run_start) * 1000)
+
+        # ── Interpreted languages ──
+        else:
+            interp_bin = cfg["interpreter"][0]
+            if shutil.which(interp_bin) is None:
+                return {
+                    "stdout": "",
+                    "stderr": f"'{interp_bin}' is not installed on this server, sir. "
+                              f"{language.upper()} execution needs it added to the Render environment.",
+                    "exit_code": 127, "runtime_ms": 0, "blocked": False,
+                }
+            src_path = os.path.join(workdir, f"program.{cfg['ext']}")
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write(code)
+            cmd = cfg["interpreter"] + [src_path]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10, cwd=workdir,
+            )
+            runtime_ms = int((time.time() - start) * 1000)
+
         return {
-            "stdout":     stdout,
-            "stderr":     stderr,
+            "stdout":     result.stdout[:50_000],
+            "stderr":     result.stderr[:10_000],
             "exit_code":  result.returncode,
             "runtime_ms": runtime_ms,
             "blocked":    False,
         }
     except subprocess.TimeoutExpired:
         return {
-            "stdout":     "",
-            "stderr":     "[TIMEOUT] Code exceeded the 10-second execution limit.",
-            "exit_code":  124,
-            "runtime_ms": 10000,
-            "blocked":    False,
+            "stdout": "", "stderr": "[TIMEOUT] Code exceeded the execution time limit.",
+            "exit_code": 124, "runtime_ms": int((time.time() - start) * 1000), "blocked": False,
         }
     except FileNotFoundError:
         return {
-            "stdout":     "",
-            "stderr":     f"Interpreter not found for '{language}' on this server.",
-            "exit_code":  127,
-            "runtime_ms": 0,
-            "blocked":    False,
+            "stdout": "", "stderr": f"Interpreter/compiler not found for '{language}' on this server.",
+            "exit_code": 127, "runtime_ms": 0, "blocked": False,
         }
     except Exception as e:
         return {
-            "stdout":     "",
-            "stderr":     f"Execution error: {e}",
-            "exit_code":  1,
-            "runtime_ms": 0,
-            "blocked":    False,
+            "stdout": "", "stderr": f"Execution error: {e}",
+            "exit_code": 1, "runtime_ms": 0, "blocked": False,
         }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 @app.route("/run-code", methods=["POST"])
