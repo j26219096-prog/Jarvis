@@ -1430,7 +1430,9 @@ if (!SR) {
 
 function toggleMic() {
   if (!rec) return;
-  if (micActive) { rec.stop(); micActive = false; setState('idle'); }
+  if (micActive) {
+    rec.stop(); micActive = false; setState('idle');
+  } else {
     if (appState === 'thinking') return;
     if (synth) synth.cancel();
     try { rec.start(); micActive = true; setState('listening'); }
