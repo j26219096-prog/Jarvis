@@ -1958,7 +1958,7 @@ typewrite = function(text) {
 # ══════════════════════════════════════════════════════════════════════════════
 
 SW_JS = """
-const CACHE_NAME = 'jarvis-v3';
+const CACHE_NAME = 'jarvis-v4.3';
 const STATIC_ASSETS = [
   '/',
   '/offline',
