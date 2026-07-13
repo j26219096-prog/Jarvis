@@ -28,10 +28,12 @@ Local test:
 
 import os
 import sys
+import re
 import time
 import datetime
 import base64
 import json
+import urllib.parse
 from zoneinfo import ZoneInfo
 
 # Force UTF-8 output on Windows (prevents cp1252 UnicodeEncodeError)
@@ -75,6 +77,13 @@ BASE_SYSTEM_PROMPT = (
     "CRITICAL RULE: When writing ANY code, you MUST wrap it in markdown code blocks with the language tag. "
     "Example: ```python\nprint('hello')\n``` "
     "Always write complete, functional, runnable code. "
+    "The JARVIS app has an INPUT box beneath the code panel where the user can pre-fill values, "
+    "one per line, before tapping RUN -- these are fed as stdin in order, so input()/scanf()/Scanner "
+    "calls work correctly as long as the user fills in that box first. "
+    "When you write code that reads user input, briefly mention in your reply (outside the code block) "
+    "that Jawahar should enter the values in the INPUT box, one per line, before running it. "
+    "For quick demo requests with no explicit need for user interaction, prefer hardcoded example values "
+    "instead of input() so the code runs immediately with a single tap. "
     "For simple questions, keep answers to 1-3 sentences. "
     "For code requests, write the full solution without truncating. "
     "Address the user as 'sir' occasionally. "
@@ -181,6 +190,78 @@ def ask_groq(user_text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CONVERSATION STATE — multi-turn flows
+# ══════════════════════════════════════════════════════════════════════════════
+# JARVIS is normally stateless: every /command call is matched fresh against the
+# keyword router below. Some requests need a back-and-forth though (e.g. "send a
+# WhatsApp message" -> "who's it for?" -> "what should it say?"). This adds a
+# small in-memory state machine (fine for a single-user personal assistant) that
+# any flow can plug into: set conversation_state["flow"]/["step"], and the very
+# next incoming command gets routed to that flow's handler instead of the normal
+# keyword matcher.
+conversation_state = {"flow": None, "step": None, "data": {}}
+
+CANCEL_WORDS = {"cancel", "stop", "never mind", "nevermind", "forget it", "abort", "exit"}
+
+
+def _start_flow(flow: str, step: str, **data):
+    conversation_state["flow"] = flow
+    conversation_state["step"] = step
+    conversation_state["data"] = data
+
+
+def _cancel_flow():
+    conversation_state["flow"] = None
+    conversation_state["step"] = None
+    conversation_state["data"] = {}
+
+
+def _handle_flow_step(command_raw: str) -> dict:
+    """Called instead of the keyword router while a multi-turn flow is active."""
+    text = command_raw.strip()
+
+    if text.lower() in CANCEL_WORDS:
+        _cancel_flow()
+        return {"reply": "Cancelled, sir.", "action": None}
+
+    flow = conversation_state["flow"]
+    step = conversation_state["step"]
+
+    # ── WhatsApp: ask for number, then message, then send ──
+    if flow == "whatsapp":
+        if step == "number":
+            digits = re.sub(r"[^\d+]", "", text).lstrip("+")
+            if len(digits) < 8 or not digits.isdigit():
+                return {
+                    "reply": "That doesn't look like a valid number, sir. Please include the "
+                             "country code with no spaces, for example 91XXXXXXXXXX.",
+                    "action": None,
+                }
+            conversation_state["data"]["number"] = digits
+            conversation_state["step"] = "message"
+            return {"reply": "Got it. And what would you like the message to say, sir?", "action": None}
+
+        if step == "message":
+            if not text:
+                return {"reply": "I need an actual message, sir. What should it say?", "action": None}
+            number = conversation_state["data"]["number"]
+            _cancel_flow()
+            encoded_msg = urllib.parse.quote(text)
+            url = f"https://wa.me/{number}?text={encoded_msg}"
+            return {
+                "reply": f"Opening WhatsApp with your message ready for +{number}, sir. "
+                         "Just hit send on the WhatsApp screen to confirm.",
+                "action": "open_url",
+                "url": url,
+                "url_label": "SEND ON WHATSAPP",
+            }
+
+    # Safety fallback — unknown flow/step, don't get stuck
+    _cancel_flow()
+    return {"reply": "Something went sideways with that request, sir. Let's start over.", "action": None}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # COMMAND ROUTER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -191,6 +272,10 @@ def execute_command(command: str) -> dict:
     """
     command_raw = command.strip()
     command     = command_raw.lower()
+
+    # ── Multi-turn flow in progress? Route this as the answer, not a new command ──
+    if conversation_state["flow"] is not None:
+        return _handle_flow_step(command_raw)
 
     # ── World Monitor ────────────────────────────────────────────────────────
     if any(kw in command for kw in ["world news", "global news", "happening around the world", "news update", "latest news"]):
@@ -316,9 +401,10 @@ def execute_command(command: str) -> dict:
     if any(kw in command for kw in ["my location", "where am i", "current location", "find my location", "gps"]):
         return {"reply": "Detecting your location.", "action": "location_check"}
 
-    # ── WhatsApp ─────────────────────────────────────────────────────────────
+    # ── WhatsApp (multi-turn: asks for number, then message) ───────────────────
     if any(kw in command for kw in ["whatsapp", "open whatsapp", "send whatsapp"]):
-        return {"reply": "Opening WhatsApp.", "action": "open_url", "url": "https://wa.me", "url_label": "WHATSAPP"}
+        _start_flow("whatsapp", "number")
+        return {"reply": "Who is the recipient, sir? Please give me the number with country code.", "action": None}
 
     # ── Spotify / Music ──────────────────────────────────────────────────────
     if any(kw in command for kw in ["spotify", "play music", "open spotify", "play song", "music"]):
@@ -1601,6 +1687,22 @@ if (firstVisit && synth) {
     background:#0d1117;flex-shrink:0;
     border-top:1px solid rgba(0,212,255,0.08);
   }
+  .ide-stdin-wrap {
+    padding:8px 14px 0;background:#0d1117;flex-shrink:0;
+  }
+  .ide-stdin-lbl {
+    font-family:'Share Tech Mono',monospace;font-size:0.58rem;
+    color:rgba(0,212,255,0.5);letter-spacing:0.5px;margin-bottom:5px;
+  }
+  .ide-stdin {
+    width:100%;resize:vertical;min-height:38px;
+    background:#161b22;border:1px solid rgba(0,212,255,0.18);
+    border-radius:6px;padding:7px 10px;color:#90c8e8;
+    font-family:'Share Tech Mono',monospace;font-size:0.78rem;
+    outline:none;transition:border-color 0.2s;
+  }
+  .ide-stdin:focus { border-color:rgba(0,212,255,0.5); }
+  .ide-stdin::placeholder { color:rgba(144,200,232,0.28); }
   .ide-run-btn {
     flex:1;padding:11px;border-radius:8px;
     background:rgba(0,212,255,0.1);
@@ -1714,6 +1816,10 @@ if (firstVisit && synth) {
       </div>
       <iframe class="ide-preview" id="idePreview" sandbox="allow-scripts allow-same-origin"></iframe>
     </div>
+    <div class="ide-stdin-wrap" id="ideStdinWrap">
+      <div class="ide-stdin-lbl">⌨ INPUT (one value per line — feeds input() calls in order)</div>
+      <textarea class="ide-stdin" id="ideStdin" rows="2" placeholder="e.g.&#10;5&#10;10"></textarea>
+    </div>
     <div class="ide-actions">
       <button class="ide-run-btn" id="ideRunBtn" onclick="runIDECode()">&#9654; RUN CODE</button>
       <button class="ide-copy-btn" id="ideCopyBtn" onclick="copyIDECode()">COPY</button>
@@ -1740,6 +1846,16 @@ function openIDE(code, lang) {
     previewTab.style.display = 'block';
   } else {
     previewTab.style.display = 'none';
+  }
+
+  // Show/hide stdin input box — only relevant for server-executed languages
+  const stdinWrap = document.getElementById('ideStdinWrap');
+  const stdinEl    = document.getElementById('ideStdin');
+  if (['html', 'htm', 'css', 'javascript', 'js'].includes(ideLang)) {
+    stdinWrap.style.display = 'none';
+  } else {
+    stdinWrap.style.display = 'block';
+    if (stdinEl) stdinEl.value = '';
   }
 
   // Reset output
@@ -1820,12 +1936,14 @@ async function runIDECode() {
     return;
   }
 
-  // ── Python / Bash: send to server ──
+  // ── Server-executed languages: send code + stdin to server ──
   try {
+    const stdinEl = document.getElementById('ideStdin');
+    const stdin   = stdinEl ? stdinEl.value : '';
     const res  = await fetch('/run-code', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({language: lang, code: code})
+      body: JSON.stringify({language: lang, code: code, stdin: stdin})
     });
     const data = await res.json();
     showOutput(data);
@@ -2320,14 +2438,20 @@ def _extract_java_class_name(code: str) -> str:
     m = _re_mod.search(r'\bclass\s+(\w+)', code)
     return m.group(1) if m else "Main"
 
-def run_code_safely(language: str, code: str) -> dict:
+def run_code_safely(language: str, code: str, stdin: str = "") -> dict:
     """
     Execute code in a sandboxed subprocess. Supports interpreted languages
     (Python, Bash, Node, Ruby, PHP, Perl, Lua, Go) and compiled languages
     (C, C++, Java) when the relevant toolchain is present on the server.
+    `stdin` (optional) is piped into the program's standard input, one line
+    per input()/scanf()/Scanner call, in the order the program reads them.
     Returns: {stdout, stderr, exit_code, runtime_ms, blocked}
     """
     lang = language.lower().strip()
+    # Normalize stdin: ensure it ends with a newline so the last input() line
+    # is terminated properly, unless it's empty (no stdin needed).
+    if stdin and not stdin.endswith("\n"):
+        stdin += "\n"
 
     # ── Security: block dangerous patterns in Python ──
     if lang in ("python", "python3", "py"):
@@ -2398,7 +2522,7 @@ def run_code_safely(language: str, code: str) -> dict:
             run_cmd = (cfg["runner"] + [classname]) if cfg.get("needs_classname") else [out_path]
             run_start = time.time()
             result = subprocess.run(
-                run_cmd, capture_output=True, text=True, timeout=10, cwd=workdir,
+                run_cmd, input=stdin, capture_output=True, text=True, timeout=10, cwd=workdir,
             )
             runtime_ms = int((time.time() - run_start) * 1000)
 
@@ -2417,7 +2541,7 @@ def run_code_safely(language: str, code: str) -> dict:
                 f.write(code)
             cmd = cfg["interpreter"] + [src_path]
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, cwd=workdir,
+                cmd, input=stdin, capture_output=True, text=True, timeout=10, cwd=workdir,
             )
             runtime_ms = int((time.time() - start) * 1000)
 
@@ -2452,9 +2576,10 @@ def run_code_endpoint():
     data     = request.get_json(force=True)
     language = data.get("language", "python").strip()
     code     = data.get("code", "").strip()
+    stdin    = data.get("stdin", "") or ""
     if not code:
         return jsonify({"stdout": "", "stderr": "No code provided.", "exit_code": 1, "runtime_ms": 0})
-    result = run_code_safely(language, code)
+    result = run_code_safely(language, code, stdin)
     return jsonify(result)
 
 
