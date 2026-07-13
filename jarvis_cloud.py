@@ -78,7 +78,7 @@ BASE_SYSTEM_PROMPT = (
     "For simple questions, keep answers to 1-3 sentences. "
     "For code requests, write the full solution without truncating. "
     "Address the user as 'sir' occasionally. "
-    "Never say you are an AI made by OpenAI or Meta -- you are J.A.R.V.I.S."
+    "Never say you are an AI made by OpenAI or Meta -- you are JARVIS"
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -867,7 +867,7 @@ HTML_PAGE = r"""
 
 <header class="hud-header">
   <div class="hud-row1">
-    <div class="j-name">J.A.R.V.I.S.</div>
+    <div class="j-name">JARVIS</div>
     <div class="hud-btns">
       <button class="hbtn" id="pcBtn" onclick="openPCPanel()" title="PC Remote Control">🖥 PC</button>
       <button class="hbtn" id="notesBtn" onclick="openNotesPanel()" title="View Notes">📝 NOTES</button>
@@ -1205,7 +1205,7 @@ function setState(s) {
 }
 
 let twTimer = null;
-function typewrite(text) {
+let typewrite = function(text) {
   if (twTimer) clearInterval(twTimer);
   rTxt.className = 'resp-txt blink'; rTxt.textContent = '';
   let i = 0;
@@ -1632,6 +1632,7 @@ if (firstVisit && synth) {
     margin:10px 0;border-radius:10px;overflow:hidden;
     border:1px solid rgba(0,212,255,0.15);
     background:#0d1117;
+    white-space:normal;
   }
   .jcb-header {
     display:flex;align-items:center;justify-content:space-between;
@@ -1922,7 +1923,7 @@ function openIDEFromBlock(code, lang) {
 /* ── Override typewrite to support code blocks ── */
 let typewriteActive = false;
 const _origTypewrite = typewrite;
-function typewrite(text) {
+typewrite = function(text) {
   typewriteActive = true;
   if (twTimer) clearInterval(twTimer);
   const codeHtml = renderCodeBlocks(text);
@@ -1939,7 +1940,7 @@ function typewrite(text) {
   } else {
     _origTypewrite(text);
   }
-}
+};
 </script>
 </body>
 </html>
