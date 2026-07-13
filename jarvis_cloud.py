@@ -1958,12 +1958,17 @@ typewrite = function(text) {
 # ══════════════════════════════════════════════════════════════════════════════
 
 SW_JS = """
-const CACHE_NAME = 'jarvis-v4.3';
+const CACHE_NAME = 'jarvis-v4.4';
 const STATIC_ASSETS = [
-  '/',
   '/offline',
   '/manifest.json',
 ];
+// NOTE: '/' (index.html) is intentionally NOT pre-cached here. It changes
+// often during active development, so it must always be network-first
+// (see fetch handler below) or Chrome will keep serving a stale cached
+// version of the whole app after every redeploy, even though Edge (with
+// no prior cache) always gets the current version. That mismatch is what
+// caused "Initialising systems..." to hang forever in Chrome only.
 
 // Install — cache static assets
 self.addEventListener('install', event => {
@@ -1983,7 +1988,7 @@ self.addEventListener('activate', event => {
   self.clients.claim();
 });
 
-// Fetch — network-first for API, cache-first for static
+// Fetch — network-first for API and the HTML page, cache-first for static assets
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
@@ -1998,7 +2003,21 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // Static assets — cache-first
+  // Navigation / homepage — network-first, cache only as an offline fallback
+  if (event.request.mode === 'navigate' || url.pathname === '/') {
+    event.respondWith(
+      fetch(event.request).then(res => {
+        if (res && res.status === 200) {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
+        }
+        return res;
+      }).catch(() => caches.match(event.request).then(cached => cached || caches.match('/offline')))
+    );
+    return;
+  }
+
+  // Other static assets — cache-first
   event.respondWith(
     caches.match(event.request).then(cached => {
       if (cached) return cached;
