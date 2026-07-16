@@ -56,7 +56,7 @@ GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL         = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MODEL_FAST    = os.environ.get("GROQ_MODEL_FAST", "openai/gpt-oss-20b")
 NEWSAPI_KEY    = os.environ.get("NEWSAPI_KEY", "")
-MAX_HISTORY    = 8
+MAX_HISTORY    = int(os.environ.get("MAX_HISTORY", 20))
 PORT           = int(os.environ.get("PORT", 5000))
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -99,6 +99,130 @@ memory_docs: list[dict] = []   # {"text": "...", "time": "..."}
 session_notes: list[dict] = []  # {"text": "...", "time": "..."}
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENT CHAT HISTORY STORE
+# ══════════════════════════════════════════════════════════════════════════════
+# The in-memory `chat_history` list below only exists to feed short-term context
+# to the LLM (capped at MAX_HISTORY exchanges) and is lost on every restart.
+# This store is separate and permanent: every exchange gets logged here too, so
+# the full conversation can be browsed anytime via GET /history, independent of
+# how much (or little) the LLM itself remembers in a given reply.
+#
+# Storage backend:
+#   - If DATABASE_URL is set (e.g. a free Neon Postgres instance), history is
+#     stored there and survives Render redeploys/restarts.
+#   - Otherwise it falls back to a local SQLite file. This works immediately
+#     with zero setup, but note Render's free-tier disk is not guaranteed to
+#     survive every redeploy -- set DATABASE_URL for guaranteed durability.
+
+import sqlite3
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+_pg_pool = None
+
+if DATABASE_URL:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        _pg_conn_kwargs = {"dsn": DATABASE_URL}
+        if "sslmode" not in DATABASE_URL and "localhost" not in DATABASE_URL:
+            _pg_conn_kwargs["dsn"] += ("&" if "?" in DATABASE_URL else "?") + "sslmode=require"
+        HISTORY_BACKEND = "postgres"
+    except ImportError:
+        print("[HISTORY] psycopg2 not installed -- add 'psycopg2-binary' to requirements.txt "
+              "to use DATABASE_URL. Falling back to SQLite for now.")
+        HISTORY_BACKEND = "sqlite"
+else:
+    HISTORY_BACKEND = "sqlite"
+
+SQLITE_PATH = os.environ.get("SQLITE_PATH", "jarvis_history.db")
+
+
+def _get_conn():
+    if HISTORY_BACKEND == "postgres":
+        return psycopg2.connect(**_pg_conn_kwargs)
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_history_db():
+    conn = _get_conn()
+    cur = conn.cursor()
+    if HISTORY_BACKEND == "postgres":
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_log (
+                id SERIAL PRIMARY KEY,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    conn.commit()
+    conn.close()
+    print(f"[HISTORY] Persistent chat log ready (backend: {HISTORY_BACKEND})")
+
+
+def log_message(role: str, content: str) -> None:
+    """Permanently log one exchange. Failures here never break a live reply."""
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        placeholder = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        cur.execute(f"INSERT INTO chat_log (role, content) VALUES ({placeholder}, {placeholder})",
+                    (role, content))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[HISTORY] Failed to log message: {e}")
+
+
+def get_history_log(limit: int = 200) -> list[dict]:
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        placeholder = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        cur.execute(
+            f"SELECT role, content, created_at FROM chat_log ORDER BY id DESC LIMIT {placeholder}",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if HISTORY_BACKEND == "postgres":
+            results = [{"role": r[0], "content": r[1], "time": str(r[2])} for r in rows]
+        else:
+            results = [{"role": r["role"], "content": r["content"], "time": r["created_at"]} for r in rows]
+        return list(reversed(results))  # oldest first
+    except Exception as e:
+        print(f"[HISTORY] Failed to fetch log: {e}")
+        return []
+
+
+def clear_history_log() -> None:
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM chat_log")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[HISTORY] Failed to clear log: {e}")
+
+
+try:
+    init_history_db()
+except Exception as e:
+    print(f"[HISTORY] Could not initialise history DB: {e}")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CHAT HISTORY & RAG
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -108,6 +232,7 @@ def update_history(role: str, content: str) -> None:
     chat_history.append({"role": role, "content": content})
     if len(chat_history) > MAX_HISTORY * 2:
         del chat_history[:len(chat_history) - MAX_HISTORY * 2]
+    log_message(role, content)   # permanent log, independent of the trimmed in-memory list
 
 def query_memory(text: str) -> str:
     if not memory_docs:
@@ -965,6 +1090,7 @@ HTML_PAGE = r"""
     <div class="hud-btns">
       <button class="hbtn" id="pcBtn" onclick="openPCPanel()" title="PC Remote Control">🖥 PC</button>
       <button class="hbtn" id="notesBtn" onclick="openNotesPanel()" title="View Notes">📝 NOTES</button>
+      <button class="hbtn" id="historyBtn" onclick="openHistoryPanel()" title="View full chat history">💬 HISTORY</button>
       <button class="hbtn" onclick="openVoicePicker()" title="Change Voice">🔊 VOICE</button>
       <div class="sys-badge">
         <div class="led" id="led"></div>
@@ -1056,6 +1182,20 @@ HTML_PAGE = r"""
       <button class="hbtn" onclick="closeNotesPanel()">✕ CLOSE</button>
     </div>
     <div class="notes-list" id="notesList"></div>
+  </div>
+</div>
+
+<!-- History Panel -->
+<div class="notes-panel" id="historyPanel">
+  <div class="notes-inner">
+    <div class="notes-hdr">
+      <span>💬 CHAT HISTORY</span>
+      <div style="display:flex;gap:6px;">
+        <button class="hbtn" id="historyClearBtn" onclick="clearHistoryLog()">🗑 CLEAR</button>
+        <button class="hbtn" onclick="closeHistoryPanel()">✕ CLOSE</button>
+      </div>
+    </div>
+    <div class="notes-list" id="historyList"></div>
   </div>
 </div>
 
@@ -1255,6 +1395,50 @@ function openNotesPanel() {
   document.getElementById('notesPanel').classList.add('on');
 }
 function closeNotesPanel() { document.getElementById('notesPanel').classList.remove('on'); }
+
+/* ── History Panel (persistent chat log from the server) ── */
+async function openHistoryPanel() {
+  const panel = document.getElementById('historyPanel');
+  const list  = document.getElementById('historyList');
+  panel.classList.add('on');
+  list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">Loading history…</p>';
+  try {
+    const res  = await fetch('/history?limit=300');
+    const data = await res.json();
+    const msgs = data.messages || [];
+    if (msgs.length === 0) {
+      list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No conversation history yet, sir.</p>';
+      return;
+    }
+    list.innerHTML = '';
+    msgs.forEach(m => {
+      const el = document.createElement('div');
+      el.className = 'note-item';
+      const who = m.role === 'user' ? 'YOU' : 'JARVIS';
+      const color = m.role === 'user' ? 'var(--blue)' : 'var(--green)';
+      el.innerHTML = `
+        <div style="font-family:'Orbitron',monospace;font-size:0.55rem;letter-spacing:2px;color:${color};margin-bottom:4px;">${who}</div>
+        <div class="note-text">${escapeHtml(m.content)}</div>
+        <div class="note-time">${m.time || ''}</div>`;
+      list.appendChild(el);
+    });
+    list.scrollTop = list.scrollHeight;
+  } catch(e) {
+    list.innerHTML = '<p style="color:var(--red);text-align:center;padding:20px;font-size:0.85rem;">Could not reach the history log.</p>';
+  }
+}
+function closeHistoryPanel() { document.getElementById('historyPanel').classList.remove('on'); }
+
+async function clearHistoryLog() {
+  if (!confirm('Clear the entire chat history? This cannot be undone.')) return;
+  try {
+    await fetch('/history/clear', { method: 'POST' });
+    showToast('HISTORY CLEARED', 'green');
+    openHistoryPanel();
+  } catch(e) {
+    showToast('FAILED TO CLEAR HISTORY', 'red');
+  }
+}
 
 /* ── PC Remote Panel ── */
 function openPCPanel()  { document.getElementById('pcPanel').classList.add('on'); }
@@ -2263,6 +2447,17 @@ def greet():
     elif 21 <= hour < 24: msg = "Good night, sir. Working late again, I see. How may I assist?"
     else:                 msg = "It is past midnight, sir. May I ask why you are still awake?"
     return jsonify({"greeting": msg})
+
+@app.route("/history", methods=["GET"])
+def history_endpoint():
+    limit = request.args.get("limit", default=200, type=int)
+    return jsonify({"messages": get_history_log(limit=limit), "backend": HISTORY_BACKEND})
+
+@app.route("/history/clear", methods=["POST"])
+def history_clear_endpoint():
+    clear_history_log()
+    chat_history.clear()
+    return jsonify({"ok": True})
 
 @app.route("/command", methods=["POST"])
 def command():
