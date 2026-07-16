@@ -150,8 +150,17 @@ def init_history_db():
     cur = conn.cursor()
     if HISTORY_BACKEND == "postgres":
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS chat_log (
                 id SERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT 'default',
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
@@ -159,8 +168,17 @@ def init_history_db():
         """)
     else:
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS chat_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL DEFAULT 'default',
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -171,29 +189,65 @@ def init_history_db():
     print(f"[HISTORY] Persistent chat log ready (backend: {HISTORY_BACKEND})")
 
 
-def log_message(role: str, content: str) -> None:
-    """Permanently log one exchange. Failures here never break a live reply."""
+def _touch_session(session_id: str, first_message: str = None) -> None:
+    """Create the session row if new (title = first message, truncated), else bump updated_at."""
     try:
         conn = _get_conn()
         cur = conn.cursor()
-        placeholder = "%s" if HISTORY_BACKEND == "postgres" else "?"
-        cur.execute(f"INSERT INTO chat_log (role, content) VALUES ({placeholder}, {placeholder})",
-                    (role, content))
+        ph = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        cur.execute(f"SELECT session_id FROM chat_sessions WHERE session_id = {ph}", (session_id,))
+        exists = cur.fetchone()
+        if exists:
+            cur.execute(
+                f"UPDATE chat_sessions SET updated_at = {'NOW()' if HISTORY_BACKEND=='postgres' else 'CURRENT_TIMESTAMP'} "
+                f"WHERE session_id = {ph}", (session_id,)
+            )
+        else:
+            title = (first_message or "New chat").strip()
+            if len(title) > 48:
+                title = title[:45].rstrip() + "..."
+            cur.execute(f"INSERT INTO chat_sessions (session_id, title) VALUES ({ph}, {ph})",
+                        (session_id, title))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[HISTORY] Failed to touch session: {e}")
+
+
+def log_message(role: str, content: str, session_id: str = "default") -> None:
+    """Permanently log one exchange under a session. Failures here never break a live reply."""
+    try:
+        if role == "user":
+            _touch_session(session_id, first_message=content)
+        else:
+            _touch_session(session_id)
+        conn = _get_conn()
+        cur = conn.cursor()
+        ph = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        cur.execute(f"INSERT INTO chat_log (session_id, role, content) VALUES ({ph}, {ph}, {ph})",
+                    (session_id, role, content))
         conn.commit()
         conn.close()
     except Exception as e:
         print(f"[HISTORY] Failed to log message: {e}")
 
 
-def get_history_log(limit: int = 200) -> list[dict]:
+def get_history_log(limit: int = 200, session_id: str = None) -> list[dict]:
     try:
         conn = _get_conn()
         cur = conn.cursor()
-        placeholder = "%s" if HISTORY_BACKEND == "postgres" else "?"
-        cur.execute(
-            f"SELECT role, content, created_at FROM chat_log ORDER BY id DESC LIMIT {placeholder}",
-            (limit,),
-        )
+        ph = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        if session_id:
+            cur.execute(
+                f"SELECT role, content, created_at FROM chat_log WHERE session_id = {ph} "
+                f"ORDER BY id DESC LIMIT {ph}",
+                (session_id, limit),
+            )
+        else:
+            cur.execute(
+                f"SELECT role, content, created_at FROM chat_log ORDER BY id DESC LIMIT {ph}",
+                (limit,),
+            )
         rows = cur.fetchall()
         conn.close()
         if HISTORY_BACKEND == "postgres":
@@ -206,11 +260,50 @@ def get_history_log(limit: int = 200) -> list[dict]:
         return []
 
 
+def list_sessions(limit: int = 100) -> list[dict]:
+    """Returns past chats, most recently active first, with a message count each."""
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        ph = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        cur.execute(f"""
+            SELECT s.session_id, s.title, s.updated_at, COUNT(c.id) as msg_count
+            FROM chat_sessions s
+            LEFT JOIN chat_log c ON c.session_id = s.session_id
+            GROUP BY s.session_id, s.title, s.updated_at
+            ORDER BY s.updated_at DESC
+            LIMIT {ph}
+        """, (limit,))
+        rows = cur.fetchall()
+        conn.close()
+        if HISTORY_BACKEND == "postgres":
+            return [{"session_id": r[0], "title": r[1], "updated_at": str(r[2]), "message_count": r[3]} for r in rows]
+        return [{"session_id": r["session_id"], "title": r["title"], "updated_at": r["updated_at"],
+                  "message_count": r["msg_count"]} for r in rows]
+    except Exception as e:
+        print(f"[HISTORY] Failed to list sessions: {e}")
+        return []
+
+
+def delete_session(session_id: str) -> None:
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        ph = "%s" if HISTORY_BACKEND == "postgres" else "?"
+        cur.execute(f"DELETE FROM chat_log WHERE session_id = {ph}", (session_id,))
+        cur.execute(f"DELETE FROM chat_sessions WHERE session_id = {ph}", (session_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[HISTORY] Failed to delete session: {e}")
+
+
 def clear_history_log() -> None:
     try:
         conn = _get_conn()
         cur = conn.cursor()
         cur.execute("DELETE FROM chat_log")
+        cur.execute("DELETE FROM chat_sessions")
         conn.commit()
         conn.close()
     except Exception as e:
@@ -225,14 +318,28 @@ except Exception as e:
 # ══════════════════════════════════════════════════════════════════════════════
 # CHAT HISTORY & RAG
 # ══════════════════════════════════════════════════════════════════════════════
+# chat_history is the SHORT-TERM buffer sent to the LLM as context (capped at
+# MAX_HISTORY exchanges). It's scoped to whichever session is currently active
+# -- CURRENT_SESSION_ID -- so switching chats swaps the LLM's working memory to
+# match, letting you genuinely continue an old conversation instead of the
+# model replying with no idea what you were talking about.
 
 chat_history: list[dict] = []
+CURRENT_SESSION_ID = "default"
+
+def set_active_session(session_id: str) -> None:
+    """Switch the active session and reload the LLM's short-term context from
+    that session's persisted history, so the next reply has real continuity."""
+    global CURRENT_SESSION_ID, chat_history
+    CURRENT_SESSION_ID = session_id or "default"
+    past = get_history_log(limit=MAX_HISTORY * 2, session_id=CURRENT_SESSION_ID)
+    chat_history = [{"role": m["role"], "content": m["content"]} for m in past]
 
 def update_history(role: str, content: str) -> None:
     chat_history.append({"role": role, "content": content})
     if len(chat_history) > MAX_HISTORY * 2:
         del chat_history[:len(chat_history) - MAX_HISTORY * 2]
-    log_message(role, content)   # permanent log, independent of the trimmed in-memory list
+    log_message(role, content, session_id=CURRENT_SESSION_ID)   # permanent log
 
 def query_memory(text: str) -> str:
     if not memory_docs:
@@ -1039,6 +1146,20 @@ HTML_PAGE = r"""
     .note-item{padding:10px 14px;border-radius:8px;border:1px solid var(--muted);background:rgba(0,15,45,0.5);}
     .note-item .note-text{font-size:0.9rem;color:var(--text);line-height:1.4;}
     .note-item .note-time{font-family:'Share Tech Mono',monospace;font-size:0.6rem;color:var(--muted);margin-top:4px;}
+    .chat-item{padding:11px 14px;border-radius:8px;border:1px solid var(--muted);background:rgba(0,15,45,0.5);cursor:pointer;transition:all 0.15s;display:flex;align-items:center;gap:10px;}
+    .chat-item:active{border-color:var(--blue);background:rgba(0,212,255,0.06);}
+    .chat-item-info{flex:1;min-width:0;}
+    .chat-item-title{font-size:0.88rem;color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+    .chat-item-meta{font-family:'Share Tech Mono',monospace;font-size:0.6rem;color:var(--muted);margin-top:3px;}
+    .chat-del-btn{flex-shrink:0;background:none;border:1px solid var(--muted);color:var(--muted);border-radius:5px;padding:5px 8px;cursor:pointer;font-size:0.7rem;}
+    .chat-del-btn:active{border-color:var(--red);color:var(--red);}
+    .chat-msg{padding:9px 12px;border-radius:8px;margin-bottom:6px;font-size:0.85rem;line-height:1.4;}
+    .chat-msg.user{background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.15);}
+    .chat-msg.assistant{background:rgba(0,255,136,0.05);border:1px solid rgba(0,255,136,0.12);}
+    .chat-msg-role{font-family:'Orbitron',monospace;font-size:0.52rem;letter-spacing:2px;margin-bottom:4px;}
+    .chat-continue-btn{margin-top:10px;padding:11px;border-radius:8px;background:rgba(0,255,136,0.08);border:1px solid rgba(0,255,136,0.35);color:var(--green);font-family:'Orbitron',monospace;font-size:0.62rem;letter-spacing:2px;cursor:pointer;width:100%;flex-shrink:0;}
+    .chat-continue-btn:active{background:rgba(0,255,136,0.18);}
+    .chat-back-btn{background:none;border:1px solid var(--muted);color:var(--text);border-radius:5px;padding:3px 10px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:0.68rem;}
 
     /* ── PC REMOTE PANEL ── */
     .pc-panel{display:none;position:fixed;inset:0;z-index:350;background:rgba(0,0,0,0.88);align-items:flex-end;justify-content:center;}
@@ -1090,7 +1211,8 @@ HTML_PAGE = r"""
     <div class="hud-btns">
       <button class="hbtn" id="pcBtn" onclick="openPCPanel()" title="PC Remote Control">🖥 PC</button>
       <button class="hbtn" id="notesBtn" onclick="openNotesPanel()" title="View Notes">📝 NOTES</button>
-      <button class="hbtn" id="historyBtn" onclick="openHistoryPanel()" title="View full chat history">💬 HISTORY</button>
+      <button class="hbtn" id="historyBtn" onclick="openHistoryPanel()" title="Browse and continue past chats">💬 CHATS</button>
+      <button class="hbtn" id="newChatBtn" onclick="startNewChat()" title="Start a new chat">➕ NEW</button>
       <button class="hbtn" onclick="openVoicePicker()" title="Change Voice">🔊 VOICE</button>
       <div class="sys-badge">
         <div class="led" id="led"></div>
@@ -1185,15 +1307,12 @@ HTML_PAGE = r"""
   </div>
 </div>
 
-<!-- History Panel -->
+<!-- Chats Panel (session list, ChatGPT/Claude-style) -->
 <div class="notes-panel" id="historyPanel">
   <div class="notes-inner">
     <div class="notes-hdr">
-      <span>💬 CHAT HISTORY</span>
-      <div style="display:flex;gap:6px;">
-        <button class="hbtn" id="historyClearBtn" onclick="clearHistoryLog()">🗑 CLEAR</button>
-        <button class="hbtn" onclick="closeHistoryPanel()">✕ CLOSE</button>
-      </div>
+      <span>💬 YOUR CHATS</span>
+      <button class="hbtn" onclick="closeHistoryPanel()">✕ CLOSE</button>
     </div>
     <div class="notes-list" id="historyList"></div>
   </div>
@@ -1396,48 +1515,151 @@ function openNotesPanel() {
 }
 function closeNotesPanel() { document.getElementById('notesPanel').classList.remove('on'); }
 
-/* ── History Panel (persistent chat log from the server) ── */
+/* ── Sessions / Chats (ChatGPT/Claude-style chat list) ── */
+let currentSessionId = localStorage.getItem('jarvisSessionId') || null;
+
+async function ensureSessionId() {
+  if (currentSessionId) return currentSessionId;
+  try {
+    const res  = await fetch('/sessions/new', { method: 'POST' });
+    const data = await res.json();
+    currentSessionId = data.session_id;
+    localStorage.setItem('jarvisSessionId', currentSessionId);
+  } catch(e) {
+    currentSessionId = 'default';
+  }
+  return currentSessionId;
+}
+
+async function startNewChat() {
+  try {
+    const res  = await fetch('/sessions/new', { method: 'POST' });
+    const data = await res.json();
+    currentSessionId = data.session_id;
+    localStorage.setItem('jarvisSessionId', currentSessionId);
+    showToast('NEW CHAT STARTED', 'green');
+    qLine.className = 'query-line';
+    qLine.textContent = '';
+    rTxt.className = 'resp-txt';
+    typewrite('New chat started, sir. How can I help?');
+  } catch(e) {
+    showToast('COULD NOT START NEW CHAT', 'red');
+  }
+}
+
 async function openHistoryPanel() {
   const panel = document.getElementById('historyPanel');
-  const list  = document.getElementById('historyList');
   panel.classList.add('on');
-  list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">Loading history…</p>';
-  try {
-    const res  = await fetch('/history?limit=300');
-    const data = await res.json();
-    const msgs = data.messages || [];
-    if (msgs.length === 0) {
-      list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No conversation history yet, sir.</p>';
-      return;
-    }
-    list.innerHTML = '';
-    msgs.forEach(m => {
-      const el = document.createElement('div');
-      el.className = 'note-item';
-      const who = m.role === 'user' ? 'YOU' : 'JARVIS';
-      const color = m.role === 'user' ? 'var(--blue)' : 'var(--green)';
-      el.innerHTML = `
-        <div style="font-family:'Orbitron',monospace;font-size:0.55rem;letter-spacing:2px;color:${color};margin-bottom:4px;">${who}</div>
-        <div class="note-text">${escapeHtml(m.content)}</div>
-        <div class="note-time">${m.time || ''}</div>`;
-      list.appendChild(el);
-    });
-    list.scrollTop = list.scrollHeight;
-  } catch(e) {
-    list.innerHTML = '<p style="color:var(--red);text-align:center;padding:20px;font-size:0.85rem;">Could not reach the history log.</p>';
-  }
+  renderChatList();
 }
 function closeHistoryPanel() { document.getElementById('historyPanel').classList.remove('on'); }
 
-async function clearHistoryLog() {
-  if (!confirm('Clear the entire chat history? This cannot be undone.')) return;
+async function renderChatList() {
+  const list = document.getElementById('historyList');
+  list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">Loading your chats…</p>';
   try {
-    await fetch('/history/clear', { method: 'POST' });
-    showToast('HISTORY CLEARED', 'green');
-    openHistoryPanel();
+    const res  = await fetch('/sessions');
+    const data = await res.json();
+    const sessions = data.sessions || [];
+    if (sessions.length === 0) {
+      list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No past chats yet, sir. Say something to start one.</p>';
+      return;
+    }
+    list.innerHTML = '';
+    sessions.forEach(s => {
+      const el = document.createElement('div');
+      el.className = 'chat-item';
+      const isActive = s.session_id === currentSessionId;
+      el.innerHTML = `
+        <div class="chat-item-info">
+          <div class="chat-item-title">${escapeHtml(s.title || 'New chat')}${isActive ? ' <span style="color:var(--green)">●</span>' : ''}</div>
+          <div class="chat-item-meta">${s.message_count || 0} messages · ${formatChatTime(s.updated_at)}</div>
+        </div>
+        <button class="chat-del-btn" title="Delete this chat">🗑</button>
+      `;
+      el.addEventListener('click', (e) => {
+        if (e.target.classList.contains('chat-del-btn')) return;
+        viewChatMessages(s.session_id, s.title);
+      });
+      el.querySelector('.chat-del-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete "${s.title || 'this chat'}"? This cannot be undone.`)) return;
+        await fetch('/sessions/' + s.session_id, { method: 'DELETE' });
+        if (s.session_id === currentSessionId) {
+          currentSessionId = null;
+          localStorage.removeItem('jarvisSessionId');
+        }
+        renderChatList();
+      });
+      list.appendChild(el);
+    });
   } catch(e) {
-    showToast('FAILED TO CLEAR HISTORY', 'red');
+    list.innerHTML = '<p style="color:var(--red);text-align:center;padding:20px;font-size:0.85rem;">Could not load chats.</p>';
   }
+}
+
+function formatChatTime(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso.replace(' ', 'T'));
+    return d.toLocaleString('en-IN', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+  } catch(e) { return iso; }
+}
+
+async function viewChatMessages(sessionId, title) {
+  const list = document.getElementById('historyList');
+  list.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">Loading…</p>';
+  try {
+    const res  = await fetch(`/sessions/${sessionId}/messages`);
+    const data = await res.json();
+    const msgs = data.messages || [];
+
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;flex-direction:column;';
+
+    const header = document.createElement('div');
+    header.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-shrink:0;';
+    header.innerHTML = `<button class="chat-back-btn">◀ BACK</button><span style="font-size:0.8rem;color:var(--text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(title || 'Chat')}</span>`;
+    header.querySelector('.chat-back-btn').addEventListener('click', renderChatList);
+
+    const msgList = document.createElement('div');
+    msgList.style.cssText = 'overflow-y:auto;max-height:42vh;';
+    if (msgs.length === 0) {
+      msgList.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;font-size:0.85rem;">No messages in this chat.</p>';
+    } else {
+      msgs.forEach(m => {
+        const mEl = document.createElement('div');
+        mEl.className = 'chat-msg ' + (m.role === 'user' ? 'user' : 'assistant');
+        mEl.innerHTML = `<div class="chat-msg-role" style="color:${m.role === 'user' ? 'var(--blue)' : 'var(--green)'}">${m.role === 'user' ? 'YOU' : 'JARVIS'}</div>${escapeHtml(m.content)}`;
+        msgList.appendChild(mEl);
+      });
+    }
+
+    const continueBtn = document.createElement('button');
+    continueBtn.className = 'chat-continue-btn';
+    continueBtn.textContent = '▶ CONTINUE THIS CHAT';
+    continueBtn.addEventListener('click', () => continueSession(sessionId, title));
+
+    wrap.appendChild(header);
+    wrap.appendChild(msgList);
+    wrap.appendChild(continueBtn);
+    list.innerHTML = '';
+    list.appendChild(wrap);
+    msgList.scrollTop = msgList.scrollHeight;
+  } catch(e) {
+    list.innerHTML = '<p style="color:var(--red);text-align:center;padding:20px;font-size:0.85rem;">Could not load this chat.</p>';
+  }
+}
+
+async function continueSession(sessionId, title) {
+  currentSessionId = sessionId;
+  localStorage.setItem('jarvisSessionId', sessionId);
+  closeHistoryPanel();
+  showToast('CONTINUING: ' + (title || 'CHAT').toUpperCase(), 'green');
+  qLine.className = 'query-line';
+  qLine.textContent = '';
+  rTxt.className = 'resp-txt';
+  typewrite(`Continuing our earlier conversation, sir. Go ahead.`);
 }
 
 /* ── PC Remote Panel ── */
@@ -1632,7 +1854,7 @@ async function runCmd(text) {
     const res  = await fetch('/command', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({command: text}),
+      body: JSON.stringify({command: text, session_id: await ensureSessionId()}),
       signal: controller.signal
     });
     clearTimeout(timeoutId);
@@ -1786,7 +2008,8 @@ if (firstVisit && synth) {
   const controller = new AbortController();
   const tId = setTimeout(() => controller.abort(), 4000);
   try {
-    const res  = await fetch('/greet', { signal: controller.signal });
+    const sid  = await ensureSessionId();
+    const res  = await fetch('/greet?session_id=' + encodeURIComponent(sid), { signal: controller.signal });
     const data = await res.json();
     clearTimeout(tId);
     setState('speaking');
@@ -2440,6 +2663,8 @@ def index():
 
 @app.route("/greet")
 def greet():
+    session_id = request.args.get("session_id", "default")
+    set_active_session(session_id)
     hour = datetime.datetime.now(IST).hour
     if   5 <= hour < 12: msg = "Good morning, sir. All systems are online and operational."
     elif 12 <= hour < 17: msg = "Good afternoon. Neural core is active and ready."
@@ -2459,10 +2684,41 @@ def history_clear_endpoint():
     chat_history.clear()
     return jsonify({"ok": True})
 
+@app.route("/sessions", methods=["GET"])
+def sessions_list_endpoint():
+    """List past chats, most recently active first -- the 'chat list' sidebar."""
+    return jsonify({"sessions": list_sessions()})
+
+@app.route("/sessions/new", methods=["POST"])
+def sessions_new_endpoint():
+    """Start a brand new chat, like clicking 'New chat' in ChatGPT/Claude."""
+    import uuid
+    new_id = uuid.uuid4().hex[:16]
+    set_active_session(new_id)
+    return jsonify({"session_id": new_id})
+
+@app.route("/sessions/<session_id>/messages", methods=["GET"])
+def sessions_messages_endpoint(session_id):
+    """Load one chat's full transcript AND make it the active session, so the
+    next message you send continues it with real context, not a blank slate."""
+    set_active_session(session_id)
+    return jsonify({"messages": get_history_log(limit=500, session_id=session_id)})
+
+@app.route("/sessions/<session_id>", methods=["DELETE"])
+def sessions_delete_endpoint(session_id):
+    delete_session(session_id)
+    global CURRENT_SESSION_ID
+    if CURRENT_SESSION_ID == session_id:
+        set_active_session("default")
+    return jsonify({"ok": True})
+
 @app.route("/command", methods=["POST"])
 def command():
-    data = request.get_json(silent=True) or {}
-    cmd  = data.get("command", "").strip()
+    data       = request.get_json(silent=True) or {}
+    cmd        = data.get("command", "").strip()
+    session_id = data.get("session_id", "default")
+    if CURRENT_SESSION_ID != session_id:
+        set_active_session(session_id)
     if not cmd:
         return jsonify({"reply": "I didn't receive a command.", "action": None})
     try:
